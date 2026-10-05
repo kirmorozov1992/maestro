@@ -3,6 +3,7 @@
 mod agent;
 mod allocation;
 mod dto;
+mod event;
 mod id;
 mod job;
 mod job_spec;
@@ -11,6 +12,7 @@ mod timestamp;
 pub use agent::{Agent, AgentAvailability, AgentHealth};
 pub use allocation::{Allocation, AllocationStatus};
 pub use dto::{AgentSnapshot, AllocationSnapshot, JobSnapshot};
+pub use event::{JobEvent, LostReason, ProcessResult, StopReason};
 pub use id::{AgentId, AllocationId, JobId};
 pub use job::{Job, JobStatus, TerminalResult};
 pub use job_spec::{
