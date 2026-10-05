@@ -13,10 +13,15 @@
   модели. Новые зависимости не добавлялись.
 - **Изменения:** `src/domain/{mod,timestamp,job,agent,allocation,dto,event}.rs`,
   `codex/docs/architecture.md`, `codex/docs/decisions.md` и этот progress-файл.
+  Для воспроизводимой сборки также добавлены в Git существующие Cargo-файлы,
+  crate-модули и CLI integration tests (`bd63f92`).
 - **Проверки:** успешно выполнены `cargo fmt --all`,
   `cargo fmt --all -- --check`, `cargo check --all-targets`,
   `cargo test --all-targets` (33 unit + 10 CLI, всего 43 теста),
   `cargo clippy --all-targets -- -D warnings` и `git diff --check`.
+- **Чистый checkout:** архив HEAD прошёл `cargo fmt --all -- --check`,
+  `cargo check --all-targets --offline`, `cargo test --all-targets --offline`
+  (43/43) и `cargo clippy --all-targets --offline -- -D warnings`.
 - **Дата:** 2026-10-06.
 
 ## Следующая задача
