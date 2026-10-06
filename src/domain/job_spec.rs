@@ -31,7 +31,7 @@ impl JobSpec {
             env,
             working_dir,
         };
-        spec.validate_size_limits()?;
+        spec.validate()?;
         Ok(spec)
     }
 
@@ -51,7 +51,17 @@ impl JobSpec {
         self.working_dir.as_deref()
     }
 
-    fn validate_size_limits(&self) -> Result<(), JobSpecError> {
+    fn validate(&self) -> Result<(), JobSpecError> {
+        if self.command.trim().is_empty() {
+            return Err(JobSpecError::EmptyCommand);
+        }
+        if self
+            .working_dir
+            .as_deref()
+            .is_some_and(|working_dir| working_dir.trim().is_empty())
+        {
+            return Err(JobSpecError::EmptyWorkingDirectory);
+        }
         ensure_within_limit(
             self.command.len(),
             MAX_COMMAND_BYTES,
@@ -132,6 +142,8 @@ impl<'de> Deserialize<'de> for JobSpec {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JobSpecError {
+    EmptyCommand,
+    EmptyWorkingDirectory,
     CommandTooLong {
         actual_bytes: usize,
         max_bytes: usize,
@@ -150,31 +162,55 @@ pub enum JobSpecError {
     },
 }
 
+impl JobSpecError {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::EmptyCommand => "empty_command",
+            Self::EmptyWorkingDirectory => "empty_working_directory",
+            Self::CommandTooLong { .. } => "command_too_long",
+            Self::ArgumentsTooLong { .. } => "arguments_too_long",
+            Self::EnvironmentTooLong { .. } => "environment_too_long",
+            Self::WorkingDirectoryTooLong { .. } => "working_directory_too_long",
+        }
+    }
+}
+
 impl fmt::Display for JobSpecError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (field, actual_bytes, max_bytes) = match self {
+        match self {
+            Self::EmptyCommand => formatter.write_str("command must not be empty"),
+            Self::EmptyWorkingDirectory => {
+                formatter.write_str("working directory must not be empty")
+            }
             Self::CommandTooLong {
                 actual_bytes,
                 max_bytes,
-            } => ("command", actual_bytes, max_bytes),
+            } => write!(
+                formatter,
+                "command uses {actual_bytes} bytes; limit is {max_bytes} bytes"
+            ),
             Self::ArgumentsTooLong {
                 actual_bytes,
                 max_bytes,
-            } => ("arguments", actual_bytes, max_bytes),
+            } => write!(
+                formatter,
+                "arguments use {actual_bytes} bytes; limit is {max_bytes} bytes"
+            ),
             Self::EnvironmentTooLong {
                 actual_bytes,
                 max_bytes,
-            } => ("environment", actual_bytes, max_bytes),
+            } => write!(
+                formatter,
+                "environment uses {actual_bytes} bytes; limit is {max_bytes} bytes"
+            ),
             Self::WorkingDirectoryTooLong {
                 actual_bytes,
                 max_bytes,
-            } => ("working directory", actual_bytes, max_bytes),
-        };
-
-        write!(
-            formatter,
-            "{field} uses {actual_bytes} bytes; limit is {max_bytes} bytes"
-        )
+            } => write!(
+                formatter,
+                "working directory uses {actual_bytes} bytes; limit is {max_bytes} bytes"
+            ),
+        }
     }
 }
 
@@ -277,6 +313,80 @@ mod tests {
         assert!(spec.args().is_empty());
         assert!(spec.env().is_none());
         assert!(spec.working_dir().is_none());
+    }
+
+    #[test]
+    fn rejects_empty_commands_in_constructor_and_deserialization() {
+        let error = JobSpec::new(" \t\n", vec![], None, None).unwrap_err();
+        assert_eq!(error, JobSpecError::EmptyCommand);
+        assert_eq!(error.code(), "empty_command");
+
+        let error = serde_json::from_str::<JobSpec>(r#"{"command":"  "}"#).unwrap_err();
+        assert_eq!(error.to_string(), JobSpecError::EmptyCommand.to_string());
+    }
+
+    #[test]
+    fn rejects_blank_working_directory_with_a_stable_code() {
+        let error = JobSpec::new("program", vec![], None, Some(" \t".into())).unwrap_err();
+        assert_eq!(error, JobSpecError::EmptyWorkingDirectory);
+        assert_eq!(error.code(), "empty_working_directory");
+    }
+
+    #[test]
+    fn job_spec_errors_have_stable_codes() {
+        let errors = [
+            (JobSpecError::EmptyCommand, "empty_command"),
+            (
+                JobSpecError::EmptyWorkingDirectory,
+                "empty_working_directory",
+            ),
+            (
+                JobSpecError::CommandTooLong {
+                    actual_bytes: 2,
+                    max_bytes: 1,
+                },
+                "command_too_long",
+            ),
+            (
+                JobSpecError::ArgumentsTooLong {
+                    actual_bytes: 2,
+                    max_bytes: 1,
+                },
+                "arguments_too_long",
+            ),
+            (
+                JobSpecError::EnvironmentTooLong {
+                    actual_bytes: 2,
+                    max_bytes: 1,
+                },
+                "environment_too_long",
+            ),
+            (
+                JobSpecError::WorkingDirectoryTooLong {
+                    actual_bytes: 2,
+                    max_bytes: 1,
+                },
+                "working_directory_too_long",
+            ),
+        ];
+
+        for (error, expected_code) in errors {
+            assert_eq!(error.code(), expected_code);
+        }
+    }
+
+    #[test]
+    fn preserves_shell_metacharacters_as_literal_input() {
+        let spec = JobSpec::new(
+            "program; $HOME",
+            vec!["$(touch marker)".into(), "two words".into()],
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(spec.command(), "program; $HOME");
+        assert_eq!(spec.args(), ["$(touch marker)", "two words"]);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Configuration resolution and validation for CLI modes.
 
+use crate::worker::working_directory::{WorkingDirectoryError, resolve_job_working_directory};
 use std::{
     env,
     error::Error,
@@ -88,6 +89,7 @@ pub(crate) enum ConfigError {
     ZeroDuration { setting: &'static str },
     WorkingDirectoryNotDirectory,
     WorkingDirectoryIo { source: io::Error },
+    WorkingDirectoryResolution { source: WorkingDirectoryError },
 }
 
 impl fmt::Display for ConfigError {
@@ -103,6 +105,11 @@ impl fmt::Display for ConfigError {
             Self::WorkingDirectoryIo { .. } => {
                 formatter.write_str("agent working directory could not be created or accessed")
             }
+            Self::WorkingDirectoryResolution { source } => write!(
+                formatter,
+                "agent working directory could not be accessed ({})",
+                source.code()
+            ),
         }
     }
 }
@@ -111,6 +118,7 @@ impl Error for ConfigError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::WorkingDirectoryIo { source } => Some(source),
+            Self::WorkingDirectoryResolution { source } => Some(source),
             Self::InvalidValue { .. }
             | Self::ZeroDuration { .. }
             | Self::WorkingDirectoryNotDirectory => None,
@@ -245,7 +253,8 @@ fn ensure_working_directory(path: &Path) -> Result<PathBuf, ConfigError> {
     if !metadata.is_dir() {
         return Err(ConfigError::WorkingDirectoryNotDirectory);
     }
-    fs::canonicalize(path).map_err(|source| ConfigError::WorkingDirectoryIo { source })
+    resolve_job_working_directory(Path::new("."), Some(path))
+        .map_err(|source| ConfigError::WorkingDirectoryResolution { source })
 }
 
 #[cfg(test)]
