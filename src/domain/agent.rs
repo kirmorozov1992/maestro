@@ -40,6 +40,14 @@ impl Agent {
     pub fn availability(&self) -> AgentAvailability {
         self.availability
     }
+
+    pub(crate) fn update_last_heartbeat_at(&mut self, timestamp: Timestamp) {
+        self.last_heartbeat_at = timestamp;
+    }
+
+    pub(crate) fn set_availability(&mut self, availability: AgentAvailability) {
+        self.availability = availability;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
