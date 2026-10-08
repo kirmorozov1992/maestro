@@ -1,4 +1,4 @@
-use crate::domain::{JobId, JobSpec, Timestamp};
+use crate::domain::{AgentId, AllocationId, JobId, JobSpec, Timestamp};
 use serde::Serialize;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -11,6 +11,7 @@ pub struct Job {
     started_at: Option<Timestamp>,
     finished_at: Option<Timestamp>,
     terminal_result: Option<TerminalResult>,
+    terminal_allocation: Option<(AllocationId, AgentId)>,
 }
 
 impl Job {
@@ -24,6 +25,7 @@ impl Job {
             started_at: None,
             finished_at: None,
             terminal_result: None,
+            terminal_allocation: None,
         }
     }
 
@@ -57,6 +59,27 @@ impl Job {
 
     pub fn terminal_result(&self) -> Option<TerminalResult> {
         self.terminal_result
+    }
+
+    pub(super) fn terminal_allocation(&self) -> Option<(AllocationId, AgentId)> {
+        self.terminal_allocation
+    }
+
+    pub(super) fn apply_lifecycle_update(
+        &mut self,
+        status: JobStatus,
+        updated_at: Timestamp,
+        started_at: Option<Timestamp>,
+        finished_at: Option<Timestamp>,
+        terminal_result: Option<TerminalResult>,
+        terminal_allocation: Option<(AllocationId, AgentId)>,
+    ) {
+        self.status = status;
+        self.updated_at = updated_at;
+        self.started_at = started_at;
+        self.finished_at = finished_at;
+        self.terminal_result = terminal_result;
+        self.terminal_allocation = terminal_allocation;
     }
 }
 

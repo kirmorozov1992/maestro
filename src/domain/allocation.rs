@@ -65,6 +65,17 @@ impl Allocation {
     pub fn finished_at(&self) -> Option<Timestamp> {
         self.finished_at
     }
+
+    pub(super) fn apply_lifecycle_update(
+        &mut self,
+        status: AllocationStatus,
+        started_at: Option<Timestamp>,
+        finished_at: Option<Timestamp>,
+    ) {
+        self.status = status;
+        self.started_at = started_at;
+        self.finished_at = finished_at;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
