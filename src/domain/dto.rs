@@ -85,7 +85,7 @@ mod tests {
     use super::{AgentSnapshot, AllocationSnapshot, JobSnapshot};
     use crate::domain::{
         Agent, AgentAvailability, AgentHealth, AgentId, Allocation, AllocationId, AllocationStatus,
-        Job, JobId, JobSpec, Timestamp,
+        ApplyOutcome, Job, JobEvent, JobId, JobSpec, ProcessResult, Timestamp, apply_event,
     };
     use serde_json::{Value, json};
     use std::{collections::BTreeMap, num::NonZeroU32};
@@ -128,6 +128,98 @@ mod tests {
         );
         assert_eq!(job.id(), id);
         assert_eq!(job.spec().command(), "echo");
+    }
+
+    #[test]
+    fn terminal_snapshots_serialize_public_fields_without_internal_allocation_context() {
+        let job_id = "550e8400-e29b-41d4-a716-446655440000"
+            .parse::<JobId>()
+            .unwrap();
+        let allocation_id = "550e8400-e29b-41d4-a716-446655440002"
+            .parse::<AllocationId>()
+            .unwrap();
+        let agent_id = "550e8400-e29b-41d4-a716-446655440001"
+            .parse::<AgentId>()
+            .unwrap();
+        let submitted_at = Timestamp::from_unix_millis(1_742_000_000_100);
+        let assigned_at = Timestamp::from_unix_millis(1_742_000_000_110);
+        let started_at = Timestamp::from_unix_millis(1_742_000_000_120);
+        let finished_at = Timestamp::from_unix_millis(1_742_000_000_130);
+        let spec = JobSpec::new(
+            "echo",
+            vec!["hello".into()],
+            Some(BTreeMap::from([("MODE".into(), "fast".into())])),
+            Some("/work".into()),
+        )
+        .unwrap();
+        let mut job = Job::new(job_id, spec, submitted_at);
+        let mut allocation = Allocation::new(
+            allocation_id,
+            job_id,
+            agent_id,
+            NonZeroU32::new(3).unwrap(),
+            assigned_at,
+        );
+        let events = [
+            JobEvent::Assigned {
+                job_id,
+                allocation_id,
+                agent_id,
+                occurred_at: assigned_at,
+            },
+            JobEvent::Started {
+                job_id,
+                allocation_id,
+                agent_id,
+                occurred_at: started_at,
+            },
+            JobEvent::Finished {
+                job_id,
+                allocation_id,
+                agent_id,
+                occurred_at: finished_at,
+                result: ProcessResult::Exited { exit_code: 0 },
+            },
+        ];
+
+        for event in &events {
+            assert_eq!(
+                apply_event(&mut job, Some(&mut allocation), event).unwrap(),
+                ApplyOutcome::Applied
+            );
+        }
+
+        assert_eq!(
+            serde_json::to_value(JobSnapshot::from(&job)).unwrap(),
+            json!({
+                "id": job_id.to_string(),
+                "spec": {
+                    "command": "echo",
+                    "args": ["hello"],
+                    "env": {"MODE": "fast"},
+                    "working_dir": "/work"
+                },
+                "status": "succeeded",
+                "submitted_at": 1_742_000_000_100_u64,
+                "updated_at": 1_742_000_000_130_u64,
+                "started_at": 1_742_000_000_120_u64,
+                "finished_at": 1_742_000_000_130_u64,
+                "terminal_result": {"exited": {"exit_code": 0}}
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(AllocationSnapshot::from(&allocation)).unwrap(),
+            json!({
+                "id": allocation_id.to_string(),
+                "job_id": job_id.to_string(),
+                "agent_id": agent_id.to_string(),
+                "status": "succeeded",
+                "attempt": 3,
+                "assigned_at": 1_742_000_000_110_u64,
+                "started_at": 1_742_000_000_120_u64,
+                "finished_at": 1_742_000_000_130_u64
+            })
+        );
     }
 
     #[test]
