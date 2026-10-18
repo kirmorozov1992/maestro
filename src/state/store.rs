@@ -8,15 +8,14 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-// Application services in M3.3 will construct and call this crate-private boundary.
-#[allow(dead_code)]
+// Application services use this crate-private boundary for synchronous state
+// operations.
 #[derive(Clone, Default)]
 pub(crate) struct StateStore {
     inner: Arc<Mutex<StoreState>>,
 }
 
-// These collections are used by StateStore operations; production use starts in M3.3.
-#[allow(dead_code)]
+// These collections hold the state coordinated by StateStore operations.
 #[derive(Default)]
 struct StoreState {
     jobs: HashMap<JobId, Job>,
@@ -26,13 +25,6 @@ struct StoreState {
     agent_allocations: HashMap<AgentId, AllocationId>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "M3.2 store methods are called by application services in M3.3"
-    )
-)]
 impl StateStore {
     fn lock(&self) -> Result<MutexGuard<'_, StoreState>, StateStoreError> {
         self.inner.lock().map_err(|_| StateStoreError::LockPoisoned)
@@ -133,6 +125,13 @@ impl StateStore {
         Ok(())
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "M4 scheduler orchestration will reserve available agents"
+        )
+    )]
     pub(crate) fn reserve_agent(
         &self,
         id: AgentId,
@@ -185,6 +184,13 @@ impl StateStore {
         Ok(())
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "M4 scheduler orchestration will release unused reservations"
+        )
+    )]
     pub(crate) fn release_agent(
         &self,
         id: AgentId,
@@ -241,6 +247,13 @@ impl StateStore {
         Ok(())
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "M4 scheduler orchestration will create allocations"
+        )
+    )]
     pub(crate) fn create_allocation(&self, allocation: Allocation) -> Result<(), StateStoreError> {
         let id = allocation.id();
         let job_id = allocation.job_id();
@@ -304,6 +317,13 @@ impl StateStore {
         Ok(())
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "M4 scheduler orchestration will inspect allocations"
+        )
+    )]
     pub(crate) fn get_allocation(&self, id: AllocationId) -> Result<Allocation, StateStoreError> {
         let state = self.lock()?;
         state
@@ -311,6 +331,24 @@ impl StateStore {
             .get(&id)
             .cloned()
             .ok_or_else(|| StateStoreError::not_found("allocation", id))
+    }
+
+    pub(crate) fn get_allocation_for_job(
+        &self,
+        job_id: JobId,
+    ) -> Result<Option<Allocation>, StateStoreError> {
+        let allocation = {
+            let state = self.lock()?;
+            if !state.jobs.contains_key(&job_id) {
+                return Err(StateStoreError::not_found("job", job_id));
+            }
+            state
+                .allocations
+                .values()
+                .find(|allocation| allocation.job_id() == job_id)
+                .cloned()
+        };
+        Ok(allocation)
     }
 
     pub(crate) fn append_event(&self, event: &JobEvent) -> Result<ApplyOutcome, StateStoreError> {
@@ -322,7 +360,19 @@ impl StateStore {
             .cloned()
             .ok_or_else(|| StateStoreError::not_found("job", job_id))?;
         let old_status = updated_job.status();
-        let allocation_id = event_allocation_id(event);
+        // Keep a context-free stop from bypassing an allocation created before
+        // the corresponding Assigned event is applied.
+        let allocation_id = event_allocation_id(event).or_else(|| match event {
+            JobEvent::Stopped {
+                allocation_id: None,
+                ..
+            } => state
+                .allocations
+                .values()
+                .find(|allocation| allocation.job_id() == job_id)
+                .map(|allocation| allocation.id()),
+            _ => None,
+        });
         let mut updated_allocation =
             allocation_id.and_then(|id| state.allocations.get(&id).cloned());
 
@@ -718,6 +768,65 @@ mod tests {
             store.get_agent(agent_id).unwrap().availability(),
             AgentAvailability::Busy
         );
+    }
+
+    #[test]
+    fn get_allocation_for_job_returns_none_for_pending_job() {
+        let store = StateStore::default();
+        let id = job_id(1);
+        let pending_job = job(id, 100);
+        store.create_job(pending_job.clone()).unwrap();
+
+        assert_eq!(store.get_allocation_for_job(id).unwrap(), None);
+        assert_eq!(store.get_job(id).unwrap(), pending_job);
+        assert!(
+            store
+                .list_jobs()
+                .unwrap()
+                .iter()
+                .any(|stored| stored.id() == id)
+        );
+        let state = store.inner.lock().expect("store lock is not poisoned");
+        assert!(state.allocations.is_empty());
+        assert_eq!(
+            state.pending_jobs.iter().copied().collect::<Vec<_>>(),
+            vec![id]
+        );
+        assert!(state.agent_allocations.is_empty());
+    }
+
+    #[test]
+    fn get_allocation_for_job_returns_linked_allocation() {
+        let (store, id, allocation_id, agent_id) = store_with_allocation();
+        let allocation = store.get_allocation(allocation_id).unwrap();
+        let stored_job = store.get_job(id).unwrap();
+        let linked = store.get_allocation_for_job(id).unwrap();
+
+        assert_eq!(linked, Some(allocation.clone()));
+        assert_eq!(store.get_job(id).unwrap(), stored_job);
+        assert_eq!(store.get_allocation(allocation_id).unwrap(), allocation);
+        let state = store.inner.lock().expect("store lock is not poisoned");
+        assert_eq!(state.allocations.len(), 1);
+        assert_eq!(state.agent_allocations.get(&agent_id), Some(&allocation_id));
+        assert_eq!(
+            state.agents.get(&agent_id).unwrap().availability(),
+            AgentAvailability::Busy
+        );
+    }
+
+    #[test]
+    fn get_allocation_for_job_rejects_unknown_job() {
+        let store = StateStore::default();
+
+        let error = store.get_allocation_for_job(job_id(99)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StateStoreError::NotFound {
+                resource: "job",
+                ..
+            }
+        ));
     }
 
     #[test]
