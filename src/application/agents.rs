@@ -1,10 +1,18 @@
 use super::map_store_error;
 use crate::{
-    domain::{Agent, AgentId, AgentSnapshot, Timestamp},
+    domain::{
+        Agent, AgentId, AgentSnapshot, AllocationId, AllocationSnapshot, JobSnapshot, Timestamp,
+    },
     error::AppError,
-    state::store::StateStore,
+    state::store::{AssignmentStartOutcome, StateStore},
 };
 use std::time::Duration;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AgentAssignment {
+    pub(crate) job: JobSnapshot,
+    pub(crate) allocation: AllocationSnapshot,
+}
 
 #[derive(Clone)]
 pub(crate) struct AgentsService {
@@ -51,6 +59,47 @@ impl AgentsService {
         Ok(AgentSnapshot::from(&agent))
     }
 
+    pub(crate) fn poll_assignment(
+        &self,
+        agent_id: AgentId,
+        now: Timestamp,
+        timeout: Duration,
+    ) -> Result<Option<AgentAssignment>, AppError> {
+        if timeout.is_zero() {
+            return Err(AppError::invalid_input(
+                "assignment timeout must be greater than zero",
+            ));
+        }
+
+        self.store
+            .poll_assignment(agent_id, now, timeout)
+            .map(|assignment| {
+                assignment.map(|(job, allocation)| AgentAssignment {
+                    job: JobSnapshot::from(&job),
+                    allocation: AllocationSnapshot::from(&allocation),
+                })
+            })
+            .map_err(map_store_error)
+    }
+
+    pub(crate) fn acknowledge_start(
+        &self,
+        agent_id: AgentId,
+        allocation_id: AllocationId,
+        now: Timestamp,
+        timeout: Duration,
+    ) -> Result<AssignmentStartOutcome, AppError> {
+        if timeout.is_zero() {
+            return Err(AppError::invalid_input(
+                "assignment timeout must be greater than zero",
+            ));
+        }
+
+        self.store
+            .acknowledge_start(agent_id, allocation_id, now, timeout)
+            .map_err(map_store_error)
+    }
+
     pub(crate) fn sweep_liveness(
         &self,
         now: Timestamp,
@@ -72,11 +121,15 @@ impl AgentsService {
 mod tests {
     use super::AgentsService;
     use crate::{
-        domain::{Agent, AgentAvailability, AgentHealth, AgentId, Timestamp},
+        domain::{
+            Agent, AgentAvailability, AgentHealth, AgentId, Allocation, AllocationId,
+            AllocationStatus, Job, JobEvent, JobId, JobSpec, JobStatus, ProcessResult, Timestamp,
+        },
         error::ErrorKind,
         state::{error::StateStoreError, store::StateStore},
     };
     use std::{
+        num::NonZeroU32,
         sync::{Arc, Barrier},
         thread,
         time::Duration,
@@ -90,6 +143,50 @@ mod tests {
 
     fn service() -> AgentsService {
         AgentsService::new(StateStore::default())
+    }
+
+    fn job_id(value: u32) -> JobId {
+        format!("00000000-0000-4000-8000-{value:012x}")
+            .parse()
+            .expect("fixed UUID is valid")
+    }
+
+    fn allocation_id(value: u32) -> AllocationId {
+        format!("00000000-0000-4000-8002-{value:012x}")
+            .parse()
+            .expect("fixed UUID is valid")
+    }
+
+    fn scheduled_assignment(value: u32) -> (AgentsService, AgentId, JobId, AllocationId) {
+        let service = service();
+        let agent_id = agent_id(value);
+        let job_id = job_id(value);
+        let allocation_id = allocation_id(value);
+        let assigned_at = Timestamp::from_unix_millis(200);
+        service
+            .register_agent(
+                agent_id,
+                "worker.example:9000".into(),
+                Timestamp::from_unix_millis(100),
+            )
+            .unwrap();
+        let job = Job::new(
+            job_id,
+            JobSpec::new("echo", vec!["hello".into()], None, None).unwrap(),
+            Timestamp::from_unix_millis(100),
+        );
+        service.store.create_job(job).unwrap();
+        service
+            .store
+            .assign_allocation(Allocation::new(
+                allocation_id,
+                job_id,
+                agent_id,
+                NonZeroU32::new(1).unwrap(),
+                assigned_at,
+            ))
+            .unwrap();
+        (service, agent_id, job_id, allocation_id)
     }
 
     #[test]
@@ -319,6 +416,239 @@ mod tests {
         assert_eq!(
             service.store.get_agent(id).unwrap().health(),
             AgentHealth::Healthy
+        );
+    }
+
+    #[test]
+    fn repeated_assignment_polls_return_the_same_owned_assignment_until_started() {
+        let (service, agent_id, _, allocation_id) = scheduled_assignment(21);
+        let now = Timestamp::from_unix_millis(250);
+        let timeout = Duration::from_millis(1_000);
+
+        let first = service
+            .poll_assignment(agent_id, now, timeout)
+            .unwrap()
+            .unwrap();
+        let second = service
+            .poll_assignment(agent_id, now, timeout)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.allocation.id, allocation_id);
+        assert_eq!(first.allocation.status, AllocationStatus::Assigned);
+        assert_eq!(
+            service
+                .store
+                .list_queued_assignments(agent_id)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn poll_at_assignment_deadline_marks_lost_and_releases_reservation() {
+        let (service, agent_id, job_id, allocation_id) = scheduled_assignment(22);
+        let deadline = Timestamp::from_unix_millis(1_200);
+
+        let assignment = service
+            .poll_assignment(agent_id, deadline, Duration::from_millis(1_000))
+            .unwrap();
+
+        assert!(assignment.is_none());
+        assert_eq!(
+            service.store.get_job(job_id).unwrap().status(),
+            JobStatus::Lost
+        );
+        let allocation = service.store.get_allocation(allocation_id).unwrap();
+        assert_eq!(allocation.status(), AllocationStatus::Lost);
+        assert_eq!(
+            service.store.get_agent(agent_id).unwrap().availability(),
+            AgentAvailability::Idle
+        );
+        assert!(
+            service
+                .store
+                .list_queued_assignments(agent_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn zero_assignment_timeout_is_rejected_without_mutating_store() {
+        let (service, agent_id, job_id, allocation_id) = scheduled_assignment(23);
+
+        let now = Timestamp::from_unix_millis(250);
+        let error = service
+            .poll_assignment(agent_id, now, Duration::ZERO)
+            .unwrap_err();
+        let start_error = service
+            .acknowledge_start(agent_id, allocation_id, now, Duration::ZERO)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert_eq!(start_error.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            service.store.get_job(job_id).unwrap().status(),
+            JobStatus::Assigned
+        );
+        assert_eq!(
+            service
+                .store
+                .get_allocation(allocation_id)
+                .unwrap()
+                .status(),
+            AllocationStatus::Assigned
+        );
+    }
+
+    #[test]
+    fn only_assigned_agent_can_acknowledge_start_and_retries_are_idempotent() {
+        let (service, assigned_agent_id, job_id, allocation_id) = scheduled_assignment(24);
+        let timestamp = Timestamp::from_unix_millis(250);
+        let timeout = Duration::from_millis(1_000);
+        service
+            .register_agent(
+                agent_id(25),
+                "other-worker.example:9000".into(),
+                Timestamp::from_unix_millis(100),
+            )
+            .unwrap();
+
+        let wrong_agent = service
+            .acknowledge_start(agent_id(25), allocation_id, timestamp, timeout)
+            .unwrap_err();
+        assert_eq!(wrong_agent.kind(), ErrorKind::Conflict);
+        assert_eq!(
+            service.store.get_job(job_id).unwrap().status(),
+            JobStatus::Assigned
+        );
+
+        let first = service
+            .acknowledge_start(assigned_agent_id, allocation_id, timestamp, timeout)
+            .unwrap();
+        let retry = service
+            .acknowledge_start(assigned_agent_id, allocation_id, timestamp, timeout)
+            .unwrap();
+
+        assert_eq!(first, super::AssignmentStartOutcome::Started);
+        assert_eq!(retry, super::AssignmentStartOutcome::Duplicate);
+        assert_eq!(
+            service.store.get_job(job_id).unwrap().status(),
+            JobStatus::Running
+        );
+        assert!(
+            service
+                .store
+                .list_queued_assignments(assigned_agent_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            service
+                .poll_assignment(assigned_agent_id, timestamp, timeout)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn start_at_assignment_deadline_expires_instead_of_starting() {
+        let (service, agent_id, job_id, allocation_id) = scheduled_assignment(26);
+
+        let outcome = service
+            .acknowledge_start(
+                agent_id,
+                allocation_id,
+                Timestamp::from_unix_millis(1_200),
+                Duration::from_millis(1_000),
+            )
+            .unwrap();
+
+        assert_eq!(outcome, super::AssignmentStartOutcome::Expired);
+        assert_eq!(
+            service.store.get_job(job_id).unwrap().status(),
+            JobStatus::Lost
+        );
+        assert_eq!(
+            service
+                .store
+                .get_allocation(allocation_id)
+                .unwrap()
+                .status(),
+            AllocationStatus::Lost
+        );
+        assert_eq!(
+            service.store.get_agent(agent_id).unwrap().availability(),
+            AgentAvailability::Idle
+        );
+    }
+
+    #[test]
+    fn stale_start_for_previous_allocation_does_not_change_new_reservation() {
+        let (service, agent_id, old_job_id, old_allocation_id) = scheduled_assignment(27);
+        service
+            .store
+            .append_event(&JobEvent::Finished {
+                job_id: old_job_id,
+                allocation_id: old_allocation_id,
+                agent_id,
+                occurred_at: Timestamp::from_unix_millis(220),
+                result: ProcessResult::SpawnFailed,
+            })
+            .unwrap();
+        let new_job_id = job_id(28);
+        let new_allocation_id = allocation_id(28);
+        service
+            .store
+            .create_job(Job::new(
+                new_job_id,
+                JobSpec::new("echo", vec!["again".into()], None, None).unwrap(),
+                Timestamp::from_unix_millis(230),
+            ))
+            .unwrap();
+        service
+            .store
+            .assign_allocation(Allocation::new(
+                new_allocation_id,
+                new_job_id,
+                agent_id,
+                NonZeroU32::new(1).unwrap(),
+                Timestamp::from_unix_millis(240),
+            ))
+            .unwrap();
+
+        let error = service
+            .acknowledge_start(
+                agent_id,
+                old_allocation_id,
+                Timestamp::from_unix_millis(250),
+                Duration::from_millis(1_000),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::Conflict);
+        assert_eq!(
+            service.store.get_job(new_job_id).unwrap().status(),
+            JobStatus::Assigned
+        );
+        assert_eq!(
+            service
+                .store
+                .get_allocation(new_allocation_id)
+                .unwrap()
+                .status(),
+            AllocationStatus::Assigned
+        );
+        assert_eq!(
+            service
+                .store
+                .list_queued_assignments(agent_id)
+                .unwrap()
+                .len(),
+            1
         );
     }
 }

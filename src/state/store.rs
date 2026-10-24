@@ -1,7 +1,7 @@
 use super::error::StateStoreError;
 use crate::domain::{
     Agent, AgentAvailability, AgentHealth, AgentId, Allocation, AllocationId, AllocationStatus,
-    ApplyOutcome, Job, JobEvent, JobId, JobStatus, Timestamp, apply_event,
+    ApplyOutcome, Job, JobEvent, JobId, JobStatus, LostReason, Timestamp, apply_event,
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -34,36 +34,22 @@ pub(crate) struct QueuedAssignment {
     allocation_id: AllocationId,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AssignmentStartOutcome {
+    Started,
+    Duplicate,
+    Expired,
+}
+
 impl QueuedAssignment {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "M4.4 agent delivery will read queued assignment IDs"
-        )
-    )]
     pub(crate) const fn job_id(self) -> JobId {
         self.job_id
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "M4.4 agent delivery will read queued assignment IDs"
-        )
-    )]
     pub(crate) const fn agent_id(self) -> AgentId {
         self.agent_id
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "M4.4 agent delivery will read queued assignment IDs"
-        )
-    )]
     pub(crate) const fn allocation_id(self) -> AllocationId {
         self.allocation_id
     }
@@ -482,6 +468,147 @@ impl StateStore {
             .unwrap_or_default())
     }
 
+    pub(crate) fn poll_assignment(
+        &self,
+        agent_id: AgentId,
+        now: Timestamp,
+        timeout: Duration,
+    ) -> Result<Option<(Job, Allocation)>, StateStoreError> {
+        let mut state = self.lock()?;
+        if !state.agents.contains_key(&agent_id) {
+            return Err(StateStoreError::not_found("agent", agent_id));
+        }
+        let Some(queued) = state
+            .assignment_queue
+            .get(&agent_id)
+            .and_then(VecDeque::front)
+            .copied()
+        else {
+            return Ok(None);
+        };
+        if queued.agent_id() != agent_id {
+            return Err(StateStoreError::invariant(
+                "assignment queue is stored under the wrong agent",
+            ));
+        }
+        let allocation = state
+            .allocations
+            .get(&queued.allocation_id())
+            .cloned()
+            .ok_or(StateStoreError::invariant(
+                "assignment queue references a missing allocation",
+            ))?;
+        let job = state
+            .jobs
+            .get(&queued.job_id())
+            .cloned()
+            .ok_or(StateStoreError::invariant(
+                "assignment queue references a missing job",
+            ))?;
+        if allocation.job_id() != queued.job_id()
+            || allocation.agent_id() != agent_id
+            || allocation.status() != AllocationStatus::Assigned
+            || job.status() != JobStatus::Assigned
+            || state.agent_allocations.get(&agent_id) != Some(&allocation.id())
+        {
+            return Err(StateStoreError::invariant(
+                "queued assignment does not match the active reservation",
+            ));
+        }
+        if assignment_expired(now, allocation.assigned_at(), timeout) {
+            expire_assignment(&mut state, &allocation, now)?;
+            return Ok(None);
+        }
+        Ok(Some((job, allocation)))
+    }
+
+    pub(crate) fn acknowledge_start(
+        &self,
+        agent_id: AgentId,
+        allocation_id: AllocationId,
+        now: Timestamp,
+        timeout: Duration,
+    ) -> Result<AssignmentStartOutcome, StateStoreError> {
+        let mut state = self.lock()?;
+        if !state.agents.contains_key(&agent_id) {
+            return Err(StateStoreError::not_found("agent", agent_id));
+        }
+        let allocation = state
+            .allocations
+            .get(&allocation_id)
+            .cloned()
+            .ok_or_else(|| StateStoreError::not_found("allocation", allocation_id))?;
+        if allocation.agent_id() != agent_id {
+            return Err(StateStoreError::conflict(
+                "allocation",
+                allocation_id,
+                "start acknowledgement came from an agent that does not own the allocation",
+            ));
+        }
+        let job =
+            state
+                .jobs
+                .get(&allocation.job_id())
+                .cloned()
+                .ok_or(StateStoreError::invariant(
+                    "allocation references a missing job",
+                ))?;
+        let agent = state
+            .agents
+            .get(&agent_id)
+            .ok_or(StateStoreError::invariant(
+                "allocation references an unregistered agent",
+            ))?;
+        if state.agent_allocations.get(&agent_id) != Some(&allocation_id)
+            || agent.availability() != AgentAvailability::Busy
+        {
+            return Err(StateStoreError::conflict(
+                "allocation",
+                allocation_id,
+                "allocation is no longer the agent's active reservation",
+            ));
+        }
+        if allocation.status() == AllocationStatus::Running && job.status() == JobStatus::Running {
+            return Ok(AssignmentStartOutcome::Duplicate);
+        }
+        if allocation.status() != AllocationStatus::Assigned || job.status() != JobStatus::Assigned
+        {
+            return Err(StateStoreError::conflict(
+                "allocation",
+                allocation_id,
+                "only the current assigned allocation can be started",
+            ));
+        }
+        if !state.assignment_queue.get(&agent_id).is_some_and(|queue| {
+            queue
+                .iter()
+                .any(|queued| queued.allocation_id() == allocation_id)
+        }) {
+            return Err(StateStoreError::invariant(
+                "assigned allocation is missing from the delivery queue",
+            ));
+        }
+        if assignment_expired(now, allocation.assigned_at(), timeout) {
+            expire_assignment(&mut state, &allocation, now)?;
+            return Ok(AssignmentStartOutcome::Expired);
+        }
+        let outcome = apply_events_in_state(
+            &mut state,
+            &[JobEvent::Started {
+                job_id: allocation.job_id(),
+                allocation_id,
+                agent_id,
+                occurred_at: now,
+            }],
+        )?;
+        if outcome != ApplyOutcome::Applied {
+            return Err(StateStoreError::invariant(
+                "start acknowledgement did not apply to its assigned allocation",
+            ));
+        }
+        Ok(AssignmentStartOutcome::Started)
+    }
+
     #[cfg_attr(
         not(test),
         expect(
@@ -798,9 +925,17 @@ fn apply_events_in_state(
         None
     };
 
+    let completed_assignment = updated_allocation
+        .as_ref()
+        .filter(|allocation| allocation.status() != AllocationStatus::Assigned)
+        .map(|allocation| (allocation.agent_id(), allocation.id()));
+
     state.jobs.insert(job_id, updated_job);
     if let (Some(id), Some(allocation)) = (allocation_id, updated_allocation) {
         state.allocations.insert(id, allocation);
+    }
+    if let Some((agent_id, allocation_id)) = completed_assignment {
+        remove_queued_assignment(state, agent_id, allocation_id);
     }
     if let Some(index) = pending_index {
         let _ = state.pending_jobs.remove(index);
@@ -811,6 +946,52 @@ fn apply_events_in_state(
     }
 
     Ok(outcome)
+}
+
+fn assignment_expired(now: Timestamp, assigned_at: Timestamp, timeout: Duration) -> bool {
+    Duration::from_millis(
+        now.as_unix_millis()
+            .saturating_sub(assigned_at.as_unix_millis()),
+    ) >= timeout
+}
+
+fn expire_assignment(
+    state: &mut StoreState,
+    allocation: &Allocation,
+    expired_at: Timestamp,
+) -> Result<(), StateStoreError> {
+    let outcome = apply_events_in_state(
+        state,
+        &[JobEvent::Lost {
+            job_id: allocation.job_id(),
+            allocation_id: allocation.id(),
+            agent_id: allocation.agent_id(),
+            occurred_at: expired_at,
+            reason: LostReason::AssignmentExpired,
+        }],
+    )?;
+    if outcome != ApplyOutcome::Applied {
+        return Err(StateStoreError::invariant(
+            "expired assignment did not transition to lost",
+        ));
+    }
+    Ok(())
+}
+
+fn remove_queued_assignment(
+    state: &mut StoreState,
+    agent_id: AgentId,
+    allocation_id: AllocationId,
+) {
+    let remove_agent_queue = if let Some(queue) = state.assignment_queue.get_mut(&agent_id) {
+        queue.retain(|assignment| assignment.allocation_id() != allocation_id);
+        queue.is_empty()
+    } else {
+        false
+    };
+    if remove_agent_queue {
+        state.assignment_queue.remove(&agent_id);
+    }
 }
 
 fn heartbeat_expired(now: Timestamp, last_heartbeat_at: Timestamp, timeout: Duration) -> bool {

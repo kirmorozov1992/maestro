@@ -196,6 +196,7 @@ pub enum StopReason {
 #[serde(rename_all = "snake_case")]
 pub enum LostReason {
     HeartbeatExpired,
+    AssignmentExpired,
 }
 
 #[cfg(test)]
@@ -318,6 +319,28 @@ mod tests {
             let decoded: JobEvent = serde_json::from_value(serialized).unwrap();
             assert_eq!(decoded, event);
         }
+
+        let assignment_expired = JobEvent::Lost {
+            job_id: fixture_ids().0,
+            allocation_id: fixture_ids().1,
+            agent_id: fixture_ids().2,
+            occurred_at: Timestamp::from_unix_millis(1_742_000_000_123),
+            reason: LostReason::AssignmentExpired,
+        };
+        assert_eq!(
+            serde_json::to_value(&assignment_expired).unwrap(),
+            json!({
+                "type": "lost",
+                "job_id": fixture_ids().0.to_string(),
+                "allocation_id": fixture_ids().1.to_string(),
+                "agent_id": fixture_ids().2.to_string(),
+                "occurred_at": 1_742_000_000_123_u64,
+                "reason": "assignment_expired"
+            })
+        );
+        let decoded: JobEvent =
+            serde_json::from_value(serde_json::to_value(&assignment_expired).unwrap()).unwrap();
+        assert_eq!(decoded, assignment_expired);
 
         let spawn_failed = ProcessResult::SpawnFailed;
         let encoded: Value = serde_json::to_value(spawn_failed).unwrap();

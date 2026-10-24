@@ -1075,7 +1075,7 @@ mod tests {
             allocation_id: allocation.id(),
             agent_id: allocation.agent_id(),
             occurred_at: timestamp(STARTED_AT),
-            reason: LostReason::HeartbeatExpired,
+            reason: LostReason::AssignmentExpired,
         };
 
         assert_eq!(
