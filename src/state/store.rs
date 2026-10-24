@@ -24,6 +24,49 @@ struct StoreState {
     allocations: HashMap<AllocationId, Allocation>,
     pending_jobs: VecDeque<JobId>,
     agent_allocations: HashMap<AgentId, AllocationId>,
+    assignment_queue: HashMap<AgentId, VecDeque<QueuedAssignment>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct QueuedAssignment {
+    job_id: JobId,
+    agent_id: AgentId,
+    allocation_id: AllocationId,
+}
+
+impl QueuedAssignment {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "M4.4 agent delivery will read queued assignment IDs"
+        )
+    )]
+    pub(crate) const fn job_id(self) -> JobId {
+        self.job_id
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "M4.4 agent delivery will read queued assignment IDs"
+        )
+    )]
+    pub(crate) const fn agent_id(self) -> AgentId {
+        self.agent_id
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "M4.4 agent delivery will read queued assignment IDs"
+        )
+    )]
+    pub(crate) const fn allocation_id(self) -> AllocationId {
+        self.allocation_id
+    }
 }
 
 impl StateStore {
@@ -74,13 +117,6 @@ impl StateStore {
         Ok(jobs)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "M4.3 scheduler tick will consume the pending snapshot"
-        )
-    )]
     pub(crate) fn list_pending_jobs(&self) -> Result<Vec<Job>, StateStoreError> {
         let state = self.lock()?;
         let pending_count = state
@@ -124,6 +160,15 @@ impl StateStore {
 
         state.agents.insert(id, agent);
         Ok(())
+    }
+
+    pub(crate) fn list_agents(&self) -> Result<Vec<Agent>, StateStoreError> {
+        let mut agents = {
+            let state = self.lock()?;
+            state.agents.values().cloned().collect::<Vec<_>>()
+        };
+        agents.sort_by_key(Agent::id);
+        Ok(agents)
     }
 
     pub(crate) fn get_agent(&self, id: AgentId) -> Result<Agent, StateStoreError> {
@@ -282,6 +327,159 @@ impl StateStore {
         state.agent_allocations.remove(&id);
         state.agents.insert(id, agent);
         Ok(())
+    }
+
+    pub(crate) fn assign_allocation(
+        &self,
+        allocation: Allocation,
+    ) -> Result<QueuedAssignment, StateStoreError> {
+        let allocation_id = allocation.id();
+        let job_id = allocation.job_id();
+        let agent_id = allocation.agent_id();
+        let mut state = self.lock()?;
+
+        if state.allocations.contains_key(&allocation_id)
+            || state
+                .agent_allocations
+                .values()
+                .any(|reserved_id| *reserved_id == allocation_id)
+        {
+            return Err(StateStoreError::already_exists("allocation", allocation_id));
+        }
+        if allocation.status() != AllocationStatus::Assigned {
+            return Err(StateStoreError::conflict(
+                "allocation",
+                allocation_id,
+                "a new scheduler assignment must be assigned",
+            ));
+        }
+
+        let job = state
+            .jobs
+            .get(&job_id)
+            .cloned()
+            .ok_or_else(|| StateStoreError::not_found("job", job_id))?;
+        if job.status() != JobStatus::Pending {
+            return Err(StateStoreError::conflict(
+                "job",
+                job_id,
+                format!("assignment requires a pending job, got {:?}", job.status()),
+            ));
+        }
+        if pending_job_count(&state, job_id) != 1 {
+            return Err(StateStoreError::invariant(
+                "pending job must appear exactly once in the pending queue",
+            ));
+        }
+        let pending_index = state
+            .pending_jobs
+            .iter()
+            .position(|pending_id| *pending_id == job_id)
+            .ok_or(StateStoreError::invariant(
+                "pending job is absent from the pending queue",
+            ))?;
+        if let Some(existing) = state
+            .allocations
+            .values()
+            .find(|existing| existing.job_id() == job_id)
+        {
+            return Err(StateStoreError::conflict(
+                "job",
+                job_id,
+                format!("allocation {} already exists for this job", existing.id()),
+            ));
+        }
+
+        let mut agent = state
+            .agents
+            .get(&agent_id)
+            .cloned()
+            .ok_or_else(|| StateStoreError::not_found("agent", agent_id))?;
+        if agent.health() != AgentHealth::Healthy {
+            return Err(StateStoreError::conflict(
+                "agent",
+                agent_id,
+                "unhealthy agents cannot be assigned",
+            ));
+        }
+        match (state.agent_allocations.get(&agent_id), agent.availability()) {
+            (Some(_), AgentAvailability::Busy) => {
+                return Err(StateStoreError::conflict(
+                    "agent",
+                    agent_id,
+                    "agent already has a reservation",
+                ));
+            }
+            (None, AgentAvailability::Idle) => {}
+            _ => {
+                return Err(StateStoreError::invariant(
+                    "agent availability and reservation map disagree",
+                ));
+            }
+        }
+        if state.allocations.values().any(|existing| {
+            existing.agent_id() == agent_id && !is_terminal_allocation(existing.status())
+        }) {
+            return Err(StateStoreError::invariant(
+                "active allocation exists without an agent reservation",
+            ));
+        }
+
+        let event = JobEvent::Assigned {
+            job_id,
+            allocation_id,
+            agent_id,
+            occurred_at: allocation.assigned_at(),
+        };
+        let mut updated_job = job;
+        let mut updated_allocation = allocation;
+        let outcome = apply_event(&mut updated_job, Some(&mut updated_allocation), &event)
+            .map_err(StateStoreError::Transition)?;
+        if outcome != ApplyOutcome::Applied {
+            return Err(StateStoreError::invariant(
+                "new assignment did not produce an applied transition",
+            ));
+        }
+
+        agent.set_availability(AgentAvailability::Busy);
+        let assignment = QueuedAssignment {
+            job_id,
+            agent_id,
+            allocation_id,
+        };
+        state.jobs.insert(job_id, updated_job);
+        state.allocations.insert(allocation_id, updated_allocation);
+        state.pending_jobs.remove(pending_index);
+        state.agents.insert(agent_id, agent);
+        state.agent_allocations.insert(agent_id, allocation_id);
+        state
+            .assignment_queue
+            .entry(agent_id)
+            .or_default()
+            .push_back(assignment);
+        Ok(assignment)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "M4.4 agent delivery will consume queued assignments"
+        )
+    )]
+    pub(crate) fn list_queued_assignments(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<Vec<QueuedAssignment>, StateStoreError> {
+        let state = self.lock()?;
+        if !state.agents.contains_key(&agent_id) {
+            return Err(StateStoreError::not_found("agent", agent_id));
+        }
+        Ok(state
+            .assignment_queue
+            .get(&agent_id)
+            .map(|queue| queue.iter().copied().collect())
+            .unwrap_or_default())
     }
 
     #[cfg_attr(
