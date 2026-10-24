@@ -74,6 +74,42 @@ impl StateStore {
         Ok(jobs)
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "M4.3 scheduler tick will consume the pending snapshot"
+        )
+    )]
+    pub(crate) fn list_pending_jobs(&self) -> Result<Vec<Job>, StateStoreError> {
+        let state = self.lock()?;
+        let pending_count = state
+            .jobs
+            .values()
+            .filter(|job| job.status() == JobStatus::Pending)
+            .count();
+        if pending_count != state.pending_jobs.len() {
+            return Err(StateStoreError::invariant(
+                "pending queue must contain every pending job exactly once",
+            ));
+        }
+        state
+            .pending_jobs
+            .iter()
+            .map(|id| {
+                let job = state.jobs.get(id).ok_or(StateStoreError::invariant(
+                    "pending queue references a missing job",
+                ))?;
+                if job.status() != JobStatus::Pending || pending_job_count(&state, *id) != 1 {
+                    return Err(StateStoreError::invariant(
+                        "pending queue must contain each pending job exactly once",
+                    ));
+                }
+                Ok(job.clone())
+            })
+            .collect()
+    }
+
     pub(crate) fn register_agent(&self, agent: Agent) -> Result<(), StateStoreError> {
         let id = agent.id();
         let mut state = self.lock()?;
@@ -741,6 +777,45 @@ mod tests {
                 occurred_at: Timestamp::from_unix_millis(at),
             })
             .unwrap();
+    }
+
+    #[test]
+    fn list_pending_jobs_returns_empty_and_single_pending_job() {
+        let store = StateStore::default();
+        assert!(store.list_pending_jobs().unwrap().is_empty());
+
+        let pending = job(job_id(1), 100);
+        store.create_job(pending.clone()).unwrap();
+
+        assert_eq!(store.list_pending_jobs().unwrap(), vec![pending]);
+    }
+
+    #[test]
+    fn list_pending_jobs_preserves_fifo_and_is_repeatable_without_agents() {
+        let store = StateStore::default();
+        let first = job(job_id(1), 300);
+        let second = job(job_id(2), 100);
+        let third = job(job_id(3), 200);
+        store.create_job(first.clone()).unwrap();
+        store.create_job(second.clone()).unwrap();
+        store.create_job(third.clone()).unwrap();
+
+        let expected = vec![first, second, third];
+        assert_eq!(store.list_pending_jobs().unwrap(), expected);
+        assert_eq!(store.list_pending_jobs().unwrap(), expected);
+        assert!(store.inner.lock().unwrap().agents.is_empty());
+    }
+
+    #[test]
+    fn list_pending_jobs_rejects_a_missing_queue_entry() {
+        let store = StateStore::default();
+        store.create_job(job(job_id(1), 100)).unwrap();
+        store.inner.lock().unwrap().pending_jobs.clear();
+
+        assert!(matches!(
+            store.list_pending_jobs(),
+            Err(StateStoreError::InvariantViolation { .. })
+        ));
     }
 
     #[test]
@@ -1557,13 +1632,23 @@ mod tests {
         let second_job_id = job_id(2);
         let allocation_id = allocation_id(1);
         let agent_id = agent_id(1);
-        store.create_job(job(first_job_id, 100)).unwrap();
-        store.create_job(job(second_job_id, 101)).unwrap();
+        let first_job = job(first_job_id, 100);
+        let second_job = job(second_job_id, 101);
+        store.create_job(first_job.clone()).unwrap();
+        store.create_job(second_job.clone()).unwrap();
+        assert_eq!(
+            store.list_pending_jobs().unwrap(),
+            vec![first_job, second_job.clone()]
+        );
         store.register_agent(agent(agent_id, 100)).unwrap();
         store.reserve_agent(agent_id, allocation_id).unwrap();
         store
             .create_allocation(allocation(allocation_id, first_job_id, agent_id, 102))
             .unwrap();
+        assert_eq!(
+            store.list_pending_jobs().unwrap(),
+            vec![store.get_job(first_job_id).unwrap(), second_job.clone(),]
+        );
 
         store
             .append_event(&JobEvent::Assigned {
@@ -1574,6 +1659,7 @@ mod tests {
             })
             .unwrap();
 
+        assert_eq!(store.list_pending_jobs().unwrap(), vec![second_job]);
         let state = store.inner.lock().expect("store lock is not poisoned");
         assert_eq!(
             state.pending_jobs.iter().copied().collect::<Vec<_>>(),
