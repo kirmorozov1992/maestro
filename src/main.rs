@@ -2,6 +2,7 @@ mod application;
 mod config;
 pub mod domain;
 pub mod error;
+mod scheduler;
 pub(crate) mod state;
 mod transport;
 mod worker;
