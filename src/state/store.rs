@@ -6,6 +6,7 @@ use crate::domain::{
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
 };
 
 // Application services use this crate-private boundary for synchronous state
@@ -353,100 +354,236 @@ impl StateStore {
 
     pub(crate) fn append_event(&self, event: &JobEvent) -> Result<ApplyOutcome, StateStoreError> {
         let mut state = self.lock()?;
-        let job_id = event_job_id(event);
-        let mut updated_job = state
-            .jobs
-            .get(&job_id)
-            .cloned()
-            .ok_or_else(|| StateStoreError::not_found("job", job_id))?;
-        let old_status = updated_job.status();
-        // Keep a context-free stop from bypassing an allocation created before
-        // the corresponding Assigned event is applied.
-        let allocation_id = event_allocation_id(event).or_else(|| match event {
-            JobEvent::Stopped {
-                allocation_id: None,
-                ..
-            } => state
-                .allocations
-                .values()
-                .find(|allocation| allocation.job_id() == job_id)
-                .map(|allocation| allocation.id()),
-            _ => None,
-        });
-        let mut updated_allocation =
-            allocation_id.and_then(|id| state.allocations.get(&id).cloned());
+        apply_events_in_state(&mut state, std::slice::from_ref(event))
+    }
 
-        let outcome = apply_event(&mut updated_job, updated_allocation.as_mut(), event)
+    pub(crate) fn sweep_liveness(
+        &self,
+        now: Timestamp,
+        timeout: Duration,
+    ) -> Result<Vec<AgentId>, StateStoreError> {
+        let candidates = {
+            let state = self.lock()?;
+            state
+                .agents
+                .values()
+                .filter(|agent| {
+                    agent.health() == AgentHealth::Healthy
+                        && heartbeat_expired(now, agent.last_heartbeat_at(), timeout)
+                })
+                .map(Agent::id)
+                .collect::<Vec<_>>()
+        };
+
+        let mut unhealthy_agents = Vec::with_capacity(candidates.len());
+        for agent_id in candidates {
+            let mut state = self.lock()?;
+            let agent = state
+                .agents
+                .get(&agent_id)
+                .cloned()
+                .ok_or(StateStoreError::invariant(
+                    "liveness candidate is no longer registered",
+                ))?;
+            if agent.health() != AgentHealth::Healthy
+                || !heartbeat_expired(now, agent.last_heartbeat_at(), timeout)
+            {
+                continue;
+            }
+
+            if let Some(allocation_id) = state.agent_allocations.get(&agent_id).copied() {
+                let allocation =
+                    state
+                        .allocations
+                        .get(&allocation_id)
+                        .ok_or(StateStoreError::invariant(
+                            "agent reservation references a missing allocation",
+                        ))?;
+                if allocation.agent_id() != agent_id {
+                    return Err(StateStoreError::invariant(
+                        "agent reservation references another agent's allocation",
+                    ));
+                }
+                let job_id = allocation.job_id();
+                let allocation_status = allocation.status();
+                let assigned_at = allocation.assigned_at();
+                let job_status =
+                    state
+                        .jobs
+                        .get(&job_id)
+                        .map(Job::status)
+                        .ok_or(StateStoreError::invariant(
+                            "reserved allocation references a missing job",
+                        ))?;
+                let mut events = Vec::with_capacity(2);
+                if job_status == JobStatus::Pending
+                    && allocation_status == AllocationStatus::Assigned
+                {
+                    events.push(JobEvent::Assigned {
+                        job_id,
+                        allocation_id,
+                        agent_id,
+                        occurred_at: assigned_at,
+                    });
+                }
+                events.push(JobEvent::Lost {
+                    job_id,
+                    allocation_id,
+                    agent_id,
+                    occurred_at: now,
+                    reason: crate::domain::LostReason::HeartbeatExpired,
+                });
+                let outcome = apply_events_in_state(&mut state, &events)?;
+                if outcome != ApplyOutcome::Applied {
+                    return Err(StateStoreError::invariant(
+                        "liveness events did not apply to an active allocation",
+                    ));
+                }
+            } else {
+                if agent.availability() != AgentAvailability::Idle {
+                    return Err(StateStoreError::invariant(
+                        "busy agent has no reservation during liveness sweep",
+                    ));
+                }
+                if state.allocations.values().any(|allocation| {
+                    allocation.agent_id() == agent_id
+                        && !is_terminal_allocation(allocation.status())
+                }) {
+                    return Err(StateStoreError::invariant(
+                        "active allocation exists without an agent reservation",
+                    ));
+                }
+            }
+
+            let agent = state
+                .agents
+                .get_mut(&agent_id)
+                .ok_or(StateStoreError::invariant(
+                    "liveness candidate is no longer registered",
+                ))?;
+            agent.mark_unhealthy();
+            unhealthy_agents.push(agent_id);
+        }
+
+        Ok(unhealthy_agents)
+    }
+}
+
+fn apply_events_in_state(
+    state: &mut StoreState,
+    events: &[JobEvent],
+) -> Result<ApplyOutcome, StateStoreError> {
+    let Some(first_event) = events.first() else {
+        return Err(StateStoreError::invariant(
+            "event transaction cannot be empty",
+        ));
+    };
+    let job_id = event_job_id(first_event);
+    let mut updated_job = state
+        .jobs
+        .get(&job_id)
+        .cloned()
+        .ok_or_else(|| StateStoreError::not_found("job", job_id))?;
+    let old_status = updated_job.status();
+    // Keep a context-free stop from bypassing an allocation created before the
+    // corresponding Assigned event is applied.
+    let allocation_id = event_allocation_id(first_event).or_else(|| match first_event {
+        JobEvent::Stopped {
+            allocation_id: None,
+            ..
+        } => state
+            .allocations
+            .values()
+            .find(|allocation| allocation.job_id() == job_id)
+            .map(|allocation| allocation.id()),
+        _ => None,
+    });
+    let mut updated_allocation = allocation_id.and_then(|id| state.allocations.get(&id).cloned());
+
+    let mut outcome = ApplyOutcome::Applied;
+    for event in events {
+        outcome = apply_event(&mut updated_job, updated_allocation.as_mut(), event)
             .map_err(StateStoreError::Transition)?;
         if outcome != ApplyOutcome::Applied {
-            return Ok(outcome);
+            if events.len() == 1 {
+                return Ok(outcome);
+            }
+            return Err(StateStoreError::invariant(
+                "all events in a multi-event transaction must apply",
+            ));
         }
-
-        let pending_count = pending_job_count(&state, job_id);
-        let pending_index = if old_status == JobStatus::Pending {
-            if pending_count != 1 {
-                return Err(StateStoreError::invariant(
-                    "pending job must appear exactly once in the pending queue",
-                ));
-            }
-            state
-                .pending_jobs
-                .iter()
-                .position(|pending_id| *pending_id == job_id)
-        } else {
-            if pending_count != 0 {
-                return Err(StateStoreError::invariant(
-                    "non-pending job is still present in the pending queue",
-                ));
-            }
-            None
-        };
-
-        let updated_agent = if let Some(allocation) = updated_allocation.as_ref() {
-            let allocation_id = allocation.id();
-            let agent_id = allocation.agent_id();
-            if state.agent_allocations.get(&agent_id) != Some(&allocation_id) {
-                return Err(StateStoreError::invariant(
-                    "event allocation does not match the agent reservation",
-                ));
-            }
-            let mut agent =
-                state
-                    .agents
-                    .get(&agent_id)
-                    .cloned()
-                    .ok_or(StateStoreError::invariant(
-                        "event allocation references an unregistered agent",
-                    ))?;
-            if agent.availability() != AgentAvailability::Busy {
-                return Err(StateStoreError::invariant(
-                    "reserved agent is not marked busy",
-                ));
-            }
-            if is_terminal_allocation(allocation.status()) {
-                agent.set_availability(AgentAvailability::Idle);
-                Some((agent_id, agent))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        state.jobs.insert(job_id, updated_job);
-        if let (Some(id), Some(allocation)) = (allocation_id, updated_allocation) {
-            state.allocations.insert(id, allocation);
-        }
-        if let Some(index) = pending_index {
-            let _ = state.pending_jobs.remove(index);
-        }
-        if let Some((agent_id, agent)) = updated_agent {
-            state.agent_allocations.remove(&agent_id);
-            state.agents.insert(agent_id, agent);
-        }
-
-        Ok(outcome)
     }
+
+    let pending_count = pending_job_count(state, job_id);
+    let pending_index = if old_status == JobStatus::Pending {
+        if pending_count != 1 {
+            return Err(StateStoreError::invariant(
+                "pending job must appear exactly once in the pending queue",
+            ));
+        }
+        state
+            .pending_jobs
+            .iter()
+            .position(|pending_id| *pending_id == job_id)
+    } else {
+        if pending_count != 0 {
+            return Err(StateStoreError::invariant(
+                "non-pending job is still present in the pending queue",
+            ));
+        }
+        None
+    };
+
+    let updated_agent = if let Some(allocation) = updated_allocation.as_ref() {
+        let allocation_id = allocation.id();
+        let agent_id = allocation.agent_id();
+        if state.agent_allocations.get(&agent_id) != Some(&allocation_id) {
+            return Err(StateStoreError::invariant(
+                "event allocation does not match the agent reservation",
+            ));
+        }
+        let mut agent = state
+            .agents
+            .get(&agent_id)
+            .cloned()
+            .ok_or(StateStoreError::invariant(
+                "event allocation references an unregistered agent",
+            ))?;
+        if agent.availability() != AgentAvailability::Busy {
+            return Err(StateStoreError::invariant(
+                "reserved agent is not marked busy",
+            ));
+        }
+        if is_terminal_allocation(allocation.status()) {
+            agent.set_availability(AgentAvailability::Idle);
+            Some((agent_id, agent))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    state.jobs.insert(job_id, updated_job);
+    if let (Some(id), Some(allocation)) = (allocation_id, updated_allocation) {
+        state.allocations.insert(id, allocation);
+    }
+    if let Some(index) = pending_index {
+        let _ = state.pending_jobs.remove(index);
+    }
+    if let Some((agent_id, agent)) = updated_agent {
+        state.agent_allocations.remove(&agent_id);
+        state.agents.insert(agent_id, agent);
+    }
+
+    Ok(outcome)
+}
+
+fn heartbeat_expired(now: Timestamp, last_heartbeat_at: Timestamp, timeout: Duration) -> bool {
+    Duration::from_millis(
+        now.as_unix_millis()
+            .saturating_sub(last_heartbeat_at.as_unix_millis()),
+    ) >= timeout
 }
 
 fn pending_job_count(state: &StoreState, id: JobId) -> usize {
@@ -493,12 +630,12 @@ fn event_allocation_id(event: &JobEvent) -> Option<AllocationId> {
 mod tests {
     use super::StateStore;
     use crate::domain::{
-        Agent, AgentAvailability, AgentId, Allocation, AllocationId, AllocationStatus,
+        Agent, AgentAvailability, AgentHealth, AgentId, Allocation, AllocationId, AllocationStatus,
         ApplyOutcome, Job, JobEvent, JobId, JobSpec, JobStatus, ProcessResult, StopReason,
         Timestamp, apply_event,
     };
     use crate::state::error::StateStoreError;
-    use std::{collections::BTreeMap, num::NonZeroU32, sync::Arc, thread};
+    use std::{collections::BTreeMap, num::NonZeroU32, sync::Arc, thread, time::Duration};
 
     fn job_id(suffix: u32) -> JobId {
         format!("00000000-0000-4000-8000-{suffix:012x}")
@@ -564,6 +701,40 @@ mod tests {
             .create_allocation(allocation(allocation_id, job_id, agent_id, 101))
             .unwrap();
         (store, job_id, allocation_id, agent_id)
+    }
+
+    fn assign(
+        store: &StateStore,
+        job_id: JobId,
+        allocation_id: AllocationId,
+        agent_id: AgentId,
+        at: u64,
+    ) {
+        store
+            .append_event(&JobEvent::Assigned {
+                job_id,
+                allocation_id,
+                agent_id,
+                occurred_at: Timestamp::from_unix_millis(at),
+            })
+            .unwrap();
+    }
+
+    fn start(
+        store: &StateStore,
+        job_id: JobId,
+        allocation_id: AllocationId,
+        agent_id: AgentId,
+        at: u64,
+    ) {
+        store
+            .append_event(&JobEvent::Started {
+                job_id,
+                allocation_id,
+                agent_id,
+                occurred_at: Timestamp::from_unix_millis(at),
+            })
+            .unwrap();
     }
 
     #[test]
@@ -709,6 +880,171 @@ mod tests {
             store
                 .update_heartbeat(agent_id(2), Timestamp::from_unix_millis(300))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn liveness_sweep_expires_unallocated_agent_at_timeout_boundary() {
+        let store = StateStore::default();
+        let id = agent_id(1);
+        store.register_agent(agent(id, 1_000)).unwrap();
+        let timeout = Duration::from_millis(300);
+
+        assert!(
+            store
+                .sweep_liveness(Timestamp::from_unix_millis(1_299), timeout)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.get_agent(id).unwrap().health(), AgentHealth::Healthy);
+
+        assert_eq!(
+            store
+                .sweep_liveness(Timestamp::from_unix_millis(1_300), timeout)
+                .unwrap(),
+            vec![id]
+        );
+        let expired = store.get_agent(id).unwrap();
+        assert_eq!(expired.health(), AgentHealth::Unhealthy);
+        assert_eq!(expired.availability(), AgentAvailability::Idle);
+    }
+
+    #[test]
+    fn liveness_sweep_does_not_expire_a_future_heartbeat() {
+        let store = StateStore::default();
+        let id = agent_id(1);
+        store.register_agent(agent(id, 200)).unwrap();
+
+        assert!(
+            store
+                .sweep_liveness(Timestamp::from_unix_millis(199), Duration::from_millis(1))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.get_agent(id).unwrap().health(), AgentHealth::Healthy);
+    }
+
+    #[test]
+    fn liveness_sweep_loses_reserved_allocation_before_assigned_event() {
+        let (store, job_id, allocation_id, agent_id) = store_with_allocation();
+
+        assert_eq!(store.get_job(job_id).unwrap().status(), JobStatus::Pending);
+        assert_eq!(
+            store.get_allocation(allocation_id).unwrap().status(),
+            AllocationStatus::Assigned
+        );
+        assert_eq!(
+            store
+                .sweep_liveness(Timestamp::from_unix_millis(400), Duration::from_millis(300))
+                .unwrap(),
+            vec![agent_id]
+        );
+
+        assert_eq!(store.get_job(job_id).unwrap().status(), JobStatus::Lost);
+        assert_eq!(
+            store.get_allocation(allocation_id).unwrap().status(),
+            AllocationStatus::Lost
+        );
+        let agent = store.get_agent(agent_id).unwrap();
+        assert_eq!(agent.health(), AgentHealth::Unhealthy);
+        assert_eq!(agent.availability(), AgentAvailability::Idle);
+        let state = store.inner.lock().expect("store lock is not poisoned");
+        assert!(!state.pending_jobs.contains(&job_id));
+        assert!(!state.agent_allocations.contains_key(&agent_id));
+    }
+
+    #[test]
+    fn liveness_sweep_loses_assigned_job_and_releases_agent_reservation() {
+        let (store, job_id, allocation_id, agent_id) = store_with_allocation();
+        assign(&store, job_id, allocation_id, agent_id, 110);
+
+        assert_eq!(
+            store
+                .sweep_liveness(Timestamp::from_unix_millis(400), Duration::from_millis(300))
+                .unwrap(),
+            vec![agent_id]
+        );
+
+        let job = store.get_job(job_id).unwrap();
+        let allocation = store.get_allocation(allocation_id).unwrap();
+        let agent = store.get_agent(agent_id).unwrap();
+        assert_eq!(job.status(), JobStatus::Lost);
+        assert_eq!(
+            job.terminal_result(),
+            Some(crate::domain::TerminalResult::Lost)
+        );
+        assert_eq!(allocation.status(), AllocationStatus::Lost);
+        assert_eq!(agent.health(), AgentHealth::Unhealthy);
+        assert_eq!(agent.availability(), AgentAvailability::Idle);
+        assert!(
+            !store
+                .inner
+                .lock()
+                .expect("store lock is not poisoned")
+                .agent_allocations
+                .contains_key(&agent_id)
+        );
+
+        assert!(
+            store
+                .sweep_liveness(Timestamp::from_unix_millis(700), Duration::from_millis(300))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn liveness_sweep_loses_running_job_and_allocation() {
+        let (store, job_id, allocation_id, agent_id) = store_with_allocation();
+        assign(&store, job_id, allocation_id, agent_id, 110);
+        start(&store, job_id, allocation_id, agent_id, 120);
+
+        assert_eq!(
+            store
+                .sweep_liveness(Timestamp::from_unix_millis(400), Duration::from_millis(300))
+                .unwrap(),
+            vec![agent_id]
+        );
+
+        assert_eq!(store.get_job(job_id).unwrap().status(), JobStatus::Lost);
+        assert_eq!(
+            store.get_allocation(allocation_id).unwrap().status(),
+            AllocationStatus::Lost
+        );
+        assert_eq!(
+            store.get_agent(agent_id).unwrap().health(),
+            AgentHealth::Unhealthy
+        );
+    }
+
+    #[test]
+    fn rejected_stale_lost_event_preserves_agent_job_allocation_and_reservation() {
+        let (store, job_id, allocation_id, agent_id) = store_with_allocation();
+        assign(&store, job_id, allocation_id, agent_id, 110);
+        start(&store, job_id, allocation_id, agent_id, 200);
+        let job_before = store.get_job(job_id).unwrap();
+        let allocation_before = store.get_allocation(allocation_id).unwrap();
+        let agent_before = store.get_agent(agent_id).unwrap();
+
+        assert!(matches!(
+            store.sweep_liveness(Timestamp::from_unix_millis(150), Duration::from_millis(50)),
+            Err(StateStoreError::Transition(_))
+        ));
+
+        assert_eq!(store.get_job(job_id).unwrap(), job_before);
+        assert_eq!(
+            store.get_allocation(allocation_id).unwrap(),
+            allocation_before
+        );
+        assert_eq!(store.get_agent(agent_id).unwrap(), agent_before);
+        assert_eq!(
+            store
+                .inner
+                .lock()
+                .expect("store lock is not poisoned")
+                .agent_allocations
+                .get(&agent_id),
+            Some(&allocation_id)
         );
     }
 

@@ -4,6 +4,7 @@ use crate::{
     error::AppError,
     state::store::StateStore,
 };
+use std::time::Duration;
 
 #[derive(Clone)]
 pub(crate) struct AgentsService {
@@ -49,6 +50,22 @@ impl AgentsService {
         let agent = self.store.get_agent(id).map_err(map_store_error)?;
         Ok(AgentSnapshot::from(&agent))
     }
+
+    pub(crate) fn sweep_liveness(
+        &self,
+        now: Timestamp,
+        timeout: Duration,
+    ) -> Result<Vec<AgentId>, AppError> {
+        if timeout.is_zero() {
+            return Err(AppError::invalid_input(
+                "liveness timeout must be greater than zero",
+            ));
+        }
+
+        self.store
+            .sweep_liveness(now, timeout)
+            .map_err(map_store_error)
+    }
 }
 
 #[cfg(test)]
@@ -59,6 +76,7 @@ mod tests {
         error::ErrorKind,
         state::{error::StateStoreError, store::StateStore},
     };
+    use std::time::Duration;
 
     fn agent_id(value: u32) -> AgentId {
         format!("00000000-0000-4000-8001-{value:012x}")
@@ -206,5 +224,61 @@ mod tests {
             .unwrap();
 
         assert_eq!(snapshot.last_heartbeat_at, Timestamp::from_unix_millis(100));
+    }
+
+    #[test]
+    fn liveness_sweep_returns_newly_unhealthy_agent_ids() {
+        let service = service();
+        let id = agent_id(1);
+        service
+            .register_agent(
+                id,
+                "worker.example:9000".into(),
+                Timestamp::from_unix_millis(100),
+            )
+            .unwrap();
+
+        let unhealthy = service
+            .sweep_liveness(Timestamp::from_unix_millis(200), Duration::from_millis(100))
+            .unwrap();
+
+        assert_eq!(unhealthy, vec![id]);
+        assert_eq!(
+            service.store.get_agent(id).unwrap().health(),
+            AgentHealth::Unhealthy
+        );
+        let late_heartbeat = service
+            .heartbeat(id, Timestamp::from_unix_millis(250))
+            .unwrap();
+        assert_eq!(late_heartbeat.health, AgentHealth::Unhealthy);
+        assert!(
+            service
+                .sweep_liveness(Timestamp::from_unix_millis(300), Duration::from_millis(100),)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn liveness_sweep_rejects_zero_timeout_without_mutating_store() {
+        let service = service();
+        let id = agent_id(1);
+        service
+            .register_agent(
+                id,
+                "worker.example:9000".into(),
+                Timestamp::from_unix_millis(100),
+            )
+            .unwrap();
+
+        let error = service
+            .sweep_liveness(Timestamp::from_unix_millis(200), Duration::ZERO)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            service.store.get_agent(id).unwrap().health(),
+            AgentHealth::Healthy
+        );
     }
 }

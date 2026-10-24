@@ -45,6 +45,10 @@ impl Agent {
         self.last_heartbeat_at = timestamp;
     }
 
+    pub(crate) fn mark_unhealthy(&mut self) {
+        self.health = AgentHealth::Unhealthy;
+    }
+
     pub(crate) fn set_availability(&mut self, availability: AgentAvailability) {
         self.availability = availability;
     }
@@ -79,6 +83,22 @@ mod tests {
         assert_eq!(agent.last_heartbeat_at(), registered_at);
         assert_eq!(agent.health(), AgentHealth::Healthy);
         assert_eq!(agent.availability(), AgentAvailability::Idle);
+    }
+
+    #[test]
+    fn agent_can_be_marked_unhealthy_without_changing_other_state() {
+        let registered_at = Timestamp::from_unix_millis(1_742_000_000_456);
+        let mut agent = Agent::new(
+            AgentId::new(),
+            "worker.example:9000".to_owned(),
+            registered_at,
+        );
+
+        agent.mark_unhealthy();
+
+        assert_eq!(agent.health(), AgentHealth::Unhealthy);
+        assert_eq!(agent.availability(), AgentAvailability::Idle);
+        assert_eq!(agent.last_heartbeat_at(), registered_at);
     }
 
     #[test]
