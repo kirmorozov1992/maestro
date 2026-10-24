@@ -635,7 +635,13 @@ mod tests {
         Timestamp, apply_event,
     };
     use crate::state::error::StateStoreError;
-    use std::{collections::BTreeMap, num::NonZeroU32, sync::Arc, thread, time::Duration};
+    use std::{
+        collections::BTreeMap,
+        num::NonZeroU32,
+        sync::{Arc, Barrier},
+        thread,
+        time::Duration,
+    };
 
     fn job_id(suffix: u32) -> JobId {
         format!("00000000-0000-4000-8000-{suffix:012x}")
@@ -786,6 +792,45 @@ mod tests {
         assert_eq!(
             state.pending_jobs.iter().copied().collect::<Vec<_>>(),
             vec![job_id(1)]
+        );
+    }
+
+    #[test]
+    fn concurrent_duplicate_job_creation_stores_one_job_and_queue_entry() {
+        let store = StateStore::default();
+        let new_job = job(job_id(1), 100);
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = [new_job.clone(), new_job.clone()].map(|candidate| {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                store.create_job(candidate)
+            })
+        });
+
+        barrier.wait();
+        let results = handles.map(|handle| handle.join().unwrap());
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(
+                    result,
+                    Err(StateStoreError::AlreadyExists {
+                        resource: "job",
+                        ..
+                    })
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(store.list_jobs().unwrap(), vec![new_job.clone()]);
+        let state = store.inner.lock().expect("store lock is not poisoned");
+        assert_eq!(
+            state.pending_jobs.iter().copied().collect::<Vec<_>>(),
+            vec![new_job.id()]
         );
     }
 
@@ -1018,6 +1063,62 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_duplicate_terminal_reports_apply_once_and_release_reservation() {
+        let (store, job_id, allocation_id, agent_id) = store_with_allocation();
+        assign(&store, job_id, allocation_id, agent_id, 110);
+        start(&store, job_id, allocation_id, agent_id, 120);
+        let event = JobEvent::Finished {
+            job_id,
+            allocation_id,
+            agent_id,
+            occurred_at: Timestamp::from_unix_millis(130),
+            result: ProcessResult::Exited { exit_code: 0 },
+        };
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = [0, 1].map(|_| {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            let event = event.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                store.append_event(&event)
+            })
+        });
+
+        barrier.wait();
+        let results = handles.map(|handle| handle.join().unwrap().unwrap());
+
+        assert_eq!(
+            results
+                .iter()
+                .filter(|outcome| **outcome == ApplyOutcome::Applied)
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|outcome| **outcome == ApplyOutcome::Duplicate)
+                .count(),
+            1
+        );
+        assert_eq!(
+            store.get_job(job_id).unwrap().status(),
+            JobStatus::Succeeded
+        );
+        assert_eq!(
+            store.get_allocation(allocation_id).unwrap().status(),
+            AllocationStatus::Succeeded
+        );
+        assert_eq!(
+            store.get_agent(agent_id).unwrap().availability(),
+            AgentAvailability::Idle
+        );
+        let state = store.inner.lock().expect("store lock is not poisoned");
+        assert!(!state.agent_allocations.contains_key(&agent_id));
+    }
+
+    #[test]
     fn rejected_stale_lost_event_preserves_agent_job_allocation_and_reservation() {
         let (store, job_id, allocation_id, agent_id) = store_with_allocation();
         assign(&store, job_id, allocation_id, agent_id, 110);
@@ -1080,6 +1181,62 @@ mod tests {
         );
         let state = store.inner.lock().expect("store lock is not poisoned");
         assert!(!state.agent_allocations.contains_key(&id));
+    }
+
+    #[test]
+    fn concurrent_reservations_for_one_agent_choose_one_allocation() {
+        let store = StateStore::default();
+        let id = agent_id(1);
+        let first_allocation_id = allocation_id(1);
+        let second_allocation_id = allocation_id(2);
+        store.register_agent(agent(id, 100)).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = [first_allocation_id, second_allocation_id].map(|candidate| {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                store.reserve_agent(id, candidate)
+            })
+        });
+
+        barrier.wait();
+        let results = handles.map(|handle| handle.join().unwrap());
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(
+                    result,
+                    Err(StateStoreError::Conflict {
+                        resource: "agent",
+                        ..
+                    })
+                ))
+                .count(),
+            1
+        );
+        let state = store.inner.lock().expect("store lock is not poisoned");
+        let reserved_allocation = state
+            .agent_allocations
+            .get(&id)
+            .expect("one reservation must be recorded");
+        let winning_allocation = if results[0].is_ok() {
+            &first_allocation_id
+        } else {
+            &second_allocation_id
+        };
+        assert_eq!(reserved_allocation, winning_allocation);
+        assert_eq!(state.agent_allocations.len(), 1);
+        assert_eq!(
+            state.agents.get(&id).unwrap().availability(),
+            AgentAvailability::Busy
+        );
+        assert_eq!(
+            state.agents.get(&id).unwrap().health(),
+            AgentHealth::Healthy
+        );
     }
 
     #[test]

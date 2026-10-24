@@ -76,7 +76,11 @@ mod tests {
         error::ErrorKind,
         state::{error::StateStoreError, store::StateStore},
     };
-    use std::time::Duration;
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+        time::Duration,
+    };
 
     fn agent_id(value: u32) -> AgentId {
         format!("00000000-0000-4000-8001-{value:012x}")
@@ -224,6 +228,42 @@ mod tests {
             .unwrap();
 
         assert_eq!(snapshot.last_heartbeat_at, Timestamp::from_unix_millis(100));
+    }
+
+    #[test]
+    fn concurrent_equal_heartbeats_are_both_accepted() {
+        let service = service();
+        let id = agent_id(1);
+        service
+            .register_agent(
+                id,
+                "worker.example:9000".into(),
+                Timestamp::from_unix_millis(100),
+            )
+            .unwrap();
+        let timestamp = Timestamp::from_unix_millis(200);
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = [service.clone(), service.clone()].map(|service| {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                service.heartbeat(id, timestamp)
+            })
+        });
+
+        barrier.wait();
+        let results = handles.map(|handle| handle.join().unwrap());
+
+        assert!(results.iter().all(Result::is_ok));
+        assert!(
+            results
+                .iter()
+                .all(|result| result.as_ref().unwrap().last_heartbeat_at == timestamp)
+        );
+        assert_eq!(
+            service.store.get_agent(id).unwrap().last_heartbeat_at(),
+            timestamp
+        );
     }
 
     #[test]

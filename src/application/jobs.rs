@@ -143,12 +143,17 @@ mod tests {
         domain::{
             Agent, AgentAvailability, AgentId, Allocation, AllocationId, AllocationStatus,
             ApplyOutcome, Job, JobEvent, JobId, JobSpec, JobStatus, MAX_ENVIRONMENT_BYTES,
-            StopReason, Timestamp,
+            ProcessResult, StopReason, Timestamp,
         },
         error::ErrorKind,
         state::{error::StateStoreError, store::StateStore},
     };
-    use std::{collections::BTreeMap, num::NonZeroU32};
+    use std::{
+        collections::BTreeMap,
+        num::NonZeroU32,
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     fn id(value: u32) -> JobId {
         format!("00000000-0000-4000-8000-{value:012x}")
@@ -540,6 +545,71 @@ mod tests {
             service.store.get_allocation(allocation_id).unwrap(),
             before_allocation
         );
+    }
+
+    #[test]
+    fn concurrent_stop_and_finish_preserve_terminal_state() {
+        let (service, job_id, allocation_id, assigned_agent_id) = service_with_allocation(true);
+        let barrier = Arc::new(Barrier::new(3));
+        let stop_service = service.clone();
+        let stop_barrier = Arc::clone(&barrier);
+        let stop = thread::spawn(move || {
+            stop_barrier.wait();
+            stop_service.stop_job(job_id, Timestamp::from_unix_millis(400))
+        });
+        let report_service = service.clone();
+        let report_barrier = Arc::clone(&barrier);
+        let report = thread::spawn(move || {
+            report_barrier.wait();
+            report_service.report_event(JobEvent::Finished {
+                job_id,
+                allocation_id,
+                agent_id: assigned_agent_id,
+                occurred_at: Timestamp::from_unix_millis(400),
+                result: ProcessResult::Exited { exit_code: 0 },
+            })
+        });
+
+        barrier.wait();
+        let stop_outcome = stop.join().unwrap();
+        let report_outcome = report.join().unwrap().unwrap();
+
+        assert_eq!(report_outcome, ApplyOutcome::Applied);
+        match stop_outcome {
+            Ok(StopOutcome::Requested(request)) => {
+                assert_eq!(request.job_id, job_id);
+                assert_eq!(request.allocation_id, allocation_id);
+                assert_eq!(request.agent_id, assigned_agent_id);
+            }
+            Err(error) => assert_eq!(error.kind(), ErrorKind::Conflict),
+            Ok(StopOutcome::Completed(_)) => {
+                panic!("running job stop cannot complete without a terminal report")
+            }
+        }
+        assert_eq!(
+            service.store.get_job(job_id).unwrap().status(),
+            JobStatus::Succeeded
+        );
+        assert_eq!(
+            service
+                .store
+                .get_allocation(allocation_id)
+                .unwrap()
+                .status(),
+            AllocationStatus::Succeeded
+        );
+        let agent = service.store.get_agent(assigned_agent_id).unwrap();
+        assert_eq!(agent.health(), crate::domain::AgentHealth::Healthy);
+        assert_eq!(agent.availability(), AgentAvailability::Idle);
+        assert!(matches!(
+            service
+                .store
+                .release_agent(assigned_agent_id, allocation_id),
+            Err(StateStoreError::Conflict {
+                resource: "agent",
+                ..
+            })
+        ));
     }
 
     #[test]
