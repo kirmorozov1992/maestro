@@ -17,12 +17,16 @@ pub(crate) const ENV_BIND_ADDR: &str = "MAESTRO_BIND_ADDR";
 pub(crate) const ENV_HEARTBEAT_INTERVAL_SECS: &str = "MAESTRO_HEARTBEAT_INTERVAL_SECS";
 pub(crate) const ENV_POLL_INTERVAL_SECS: &str = "MAESTRO_POLL_INTERVAL_SECS";
 pub(crate) const ENV_LIVENESS_TIMEOUT_SECS: &str = "MAESTRO_LIVENESS_TIMEOUT_SECS";
+pub(crate) const ENV_ASSIGNMENT_TIMEOUT_SECS: &str = "MAESTRO_ASSIGNMENT_TIMEOUT_SECS";
+pub(crate) const ENV_SCHEDULER_INTERVAL_SECS: &str = "MAESTRO_SCHEDULER_INTERVAL_SECS";
 pub(crate) const ENV_WORKING_DIR: &str = "MAESTRO_WORKING_DIR";
 
 pub(crate) const DEFAULT_WORKING_DIR_TEXT: &str = ".";
 pub(crate) const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 pub(crate) const DEFAULT_POLL_INTERVAL_SECS: u64 = 1;
 pub(crate) const DEFAULT_LIVENESS_TIMEOUT_SECS: u64 = 30;
+pub(crate) const DEFAULT_ASSIGNMENT_TIMEOUT_SECS: u64 = 30;
+pub(crate) const DEFAULT_SCHEDULER_INTERVAL_SECS: u64 = 1;
 
 pub(crate) const HELP_SERVER_ADDR: &str =
     "Control-plane address (default: 127.0.0.1:8080; env: MAESTRO_SERVER_ADDR)";
@@ -34,6 +38,10 @@ pub(crate) const HELP_POLL_INTERVAL: &str =
     "Assignment polling interval in seconds (default: 1; env: MAESTRO_POLL_INTERVAL_SECS)";
 pub(crate) const HELP_LIVENESS_TIMEOUT: &str =
     "Agent liveness timeout in seconds (default: 30; env: MAESTRO_LIVENESS_TIMEOUT_SECS)";
+pub(crate) const HELP_ASSIGNMENT_TIMEOUT: &str =
+    "Assignment delivery timeout in seconds (default: 30; env: MAESTRO_ASSIGNMENT_TIMEOUT_SECS)";
+pub(crate) const HELP_SCHEDULER_INTERVAL: &str =
+    "Scheduler tick interval in seconds (default: 1; env: MAESTRO_SCHEDULER_INTERVAL_SECS)";
 pub(crate) const HELP_WORKING_DIR: &str =
     "Agent working directory (default: .; env: MAESTRO_WORKING_DIR)";
 
@@ -48,6 +56,8 @@ pub(crate) struct Environment {
     heartbeat_interval_secs: Option<OsString>,
     poll_interval_secs: Option<OsString>,
     liveness_timeout_secs: Option<OsString>,
+    assignment_timeout_secs: Option<OsString>,
+    scheduler_interval_secs: Option<OsString>,
     working_dir: Option<OsString>,
 }
 
@@ -59,6 +69,8 @@ impl Environment {
             heartbeat_interval_secs: env::var_os(ENV_HEARTBEAT_INTERVAL_SECS),
             poll_interval_secs: env::var_os(ENV_POLL_INTERVAL_SECS),
             liveness_timeout_secs: env::var_os(ENV_LIVENESS_TIMEOUT_SECS),
+            assignment_timeout_secs: env::var_os(ENV_ASSIGNMENT_TIMEOUT_SECS),
+            scheduler_interval_secs: env::var_os(ENV_SCHEDULER_INTERVAL_SECS),
             working_dir: env::var_os(ENV_WORKING_DIR),
         }
     }
@@ -68,6 +80,8 @@ impl Environment {
 pub(crate) struct ServerConfig {
     pub(crate) bind_addr: SocketAddr,
     pub(crate) liveness_timeout: Duration,
+    pub(crate) assignment_timeout: Duration,
+    pub(crate) scheduler_interval: Duration,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -129,6 +143,8 @@ impl Error for ConfigError {
 pub(crate) fn server(
     cli_bind_addr: Option<SocketAddr>,
     cli_liveness_timeout_secs: Option<u64>,
+    cli_assignment_timeout_secs: Option<u64>,
+    cli_scheduler_interval_secs: Option<u64>,
     environment: &Environment,
 ) -> Result<ServerConfig, ConfigError> {
     let bind_addr = resolve_value(
@@ -143,10 +159,30 @@ pub(crate) fn server(
         DEFAULT_LIVENESS_TIMEOUT_SECS,
         ENV_LIVENESS_TIMEOUT_SECS,
     )?;
+    let assignment_timeout_secs = resolve_value(
+        cli_assignment_timeout_secs,
+        environment.assignment_timeout_secs.as_deref(),
+        DEFAULT_ASSIGNMENT_TIMEOUT_SECS,
+        ENV_ASSIGNMENT_TIMEOUT_SECS,
+    )?;
+    let scheduler_interval_secs = resolve_value(
+        cli_scheduler_interval_secs,
+        environment.scheduler_interval_secs.as_deref(),
+        DEFAULT_SCHEDULER_INTERVAL_SECS,
+        ENV_SCHEDULER_INTERVAL_SECS,
+    )?;
 
     Ok(ServerConfig {
         bind_addr,
         liveness_timeout: positive_duration(liveness_timeout_secs, ENV_LIVENESS_TIMEOUT_SECS)?,
+        assignment_timeout: positive_duration(
+            assignment_timeout_secs,
+            ENV_ASSIGNMENT_TIMEOUT_SECS,
+        )?,
+        scheduler_interval: positive_duration(
+            scheduler_interval_secs,
+            ENV_SCHEDULER_INTERVAL_SECS,
+        )?,
     })
 }
 
@@ -260,9 +296,10 @@ fn ensure_working_directory(path: &Path) -> Result<PathBuf, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentConfig, ConfigError, DEFAULT_BIND_ADDR, DEFAULT_HEARTBEAT_INTERVAL_SECS,
-        DEFAULT_LIVENESS_TIMEOUT_SECS, DEFAULT_POLL_INTERVAL_SECS, DEFAULT_SERVER_ADDR,
-        DEFAULT_WORKING_DIR_TEXT, ENV_SERVER_ADDR, Environment, agent, client, server,
+        AgentConfig, ConfigError, DEFAULT_ASSIGNMENT_TIMEOUT_SECS, DEFAULT_BIND_ADDR,
+        DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_LIVENESS_TIMEOUT_SECS, DEFAULT_POLL_INTERVAL_SECS,
+        DEFAULT_SCHEDULER_INTERVAL_SECS, DEFAULT_SERVER_ADDR, DEFAULT_WORKING_DIR_TEXT,
+        ENV_SERVER_ADDR, Environment, agent, client, server,
     };
     use std::{
         ffi::OsString,
@@ -278,11 +315,23 @@ mod tests {
     #[test]
     fn resolves_defaults_for_all_modes() {
         let environment = Environment::default();
-        let server_config = server(None, None, &environment).expect("defaults are valid");
+        let server_config =
+            server(None, None, None, None, &environment).expect("defaults are valid");
         let client_config = client(None, &environment).expect("defaults are valid");
         let agent_config = agent(None, None, None, None, &environment).expect("defaults are valid");
 
         assert_eq!(server_config.bind_addr, DEFAULT_BIND_ADDR);
+        assert_eq!(
+            server_config.assignment_timeout,
+            Duration::from_secs(DEFAULT_ASSIGNMENT_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            server_config.scheduler_interval,
+            Duration::from_secs(DEFAULT_SCHEDULER_INTERVAL_SECS)
+        );
+        let server_config_debug = format!("{server_config:?}");
+        assert!(server_config_debug.contains("assignment_timeout:"));
+        assert!(server_config_debug.contains("scheduler_interval:"));
         assert_eq!(
             server_config.liveness_timeout,
             Duration::from_secs(DEFAULT_LIVENESS_TIMEOUT_SECS)
@@ -313,13 +362,18 @@ mod tests {
             heartbeat_interval_secs: Some(OsString::from("7")),
             poll_interval_secs: Some(OsString::from("3")),
             liveness_timeout_secs: Some(OsString::from("21")),
+            assignment_timeout_secs: Some(OsString::from("42")),
+            scheduler_interval_secs: Some(OsString::from("2")),
             ..Environment::default()
         };
 
         let env_client = client(None, &environment).expect("environment value is valid");
         let cli_client = client(Some(address(9002)), &environment)
             .expect("CLI value should override environment");
-        let server_config = server(None, None, &environment).expect("environment values are valid");
+        let server_config =
+            server(None, None, None, None, &environment).expect("environment values are valid");
+        let cli_server_config = server(None, None, Some(11), Some(3), &environment)
+            .expect("CLI values should override the environment");
         let agent_config =
             agent(None, None, None, None, &environment).expect("environment values are valid");
 
@@ -327,6 +381,13 @@ mod tests {
         assert_eq!(cli_client.server_addr, address(9002));
         assert_eq!(server_config.bind_addr, address(9001));
         assert_eq!(server_config.liveness_timeout, Duration::from_secs(21));
+        assert_eq!(server_config.assignment_timeout, Duration::from_secs(42));
+        assert_eq!(server_config.scheduler_interval, Duration::from_secs(2));
+        assert_eq!(
+            cli_server_config.assignment_timeout,
+            Duration::from_secs(11)
+        );
+        assert_eq!(cli_server_config.scheduler_interval, Duration::from_secs(3));
         assert_eq!(agent_config.server_addr, address(9000));
         assert_eq!(agent_config.heartbeat_interval, Duration::from_secs(7));
         assert_eq!(agent_config.poll_interval, Duration::from_secs(3));
@@ -366,7 +427,15 @@ mod tests {
         let environment = Environment::default();
 
         assert!(matches!(
-            server(None, Some(0), &environment),
+            server(None, Some(0), None, None, &environment),
+            Err(ConfigError::ZeroDuration { .. })
+        ));
+        assert!(matches!(
+            server(None, None, Some(0), None, &environment),
+            Err(ConfigError::ZeroDuration { .. })
+        ));
+        assert!(matches!(
+            server(None, None, None, Some(0), &environment),
             Err(ConfigError::ZeroDuration { .. })
         ));
         assert!(matches!(
@@ -386,6 +455,22 @@ mod tests {
             agent(None, None, None, None, &environment),
             Err(ConfigError::ZeroDuration { .. })
         ));
+
+        for environment in [
+            Environment {
+                assignment_timeout_secs: Some(OsString::from("0")),
+                ..Environment::default()
+            },
+            Environment {
+                scheduler_interval_secs: Some(OsString::from("0")),
+                ..Environment::default()
+            },
+        ] {
+            assert!(matches!(
+                server(None, None, None, None, &environment),
+                Err(ConfigError::ZeroDuration { .. })
+            ));
+        }
     }
 
     #[test]

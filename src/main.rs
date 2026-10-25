@@ -4,12 +4,13 @@ pub mod domain;
 pub mod error;
 mod scheduler;
 mod scheduler_loop;
+mod server;
 pub(crate) mod state;
 mod transport;
 mod worker;
 
 use clap::{Args, Parser, Subcommand, error::ErrorKind};
-use std::{net::SocketAddr, path::PathBuf, process::ExitCode};
+use std::{error::Error, fmt, net::SocketAddr, path::PathBuf, process::ExitCode};
 
 #[derive(Debug, Parser)]
 #[command(name = "maestro", about = "A small job orchestrator")]
@@ -37,6 +38,18 @@ struct ServerOptions {
         help = config::HELP_LIVENESS_TIMEOUT
     )]
     liveness_timeout_secs: Option<u64>,
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u64).range(1..),
+        help = config::HELP_ASSIGNMENT_TIMEOUT
+    )]
+    assignment_timeout_secs: Option<u64>,
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u64).range(1..),
+        help = config::HELP_SCHEDULER_INTERVAL
+    )]
+    scheduler_interval_secs: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -103,17 +116,16 @@ fn main() -> ExitCode {
     }
 }
 
-fn launch(command: Command, environment: &config::Environment) -> Result<(), config::ConfigError> {
+fn launch(command: Command, environment: &config::Environment) -> Result<(), LaunchError> {
     match command {
         Command::Server(options) => {
-            launch_mode(
-                "server",
-                config::server(
-                    options.bind_addr,
-                    options.liveness_timeout_secs,
-                    environment,
-                )?,
-            );
+            server::run(config::server(
+                options.bind_addr,
+                options.liveness_timeout_secs,
+                options.assignment_timeout_secs,
+                options.scheduler_interval_secs,
+                environment,
+            )?)?;
         }
         Command::Agent(options) => {
             launch_mode(
@@ -138,6 +150,42 @@ fn launch(command: Command, environment: &config::Environment) -> Result<(), con
         }
     }
     Ok(())
+}
+
+#[derive(Debug)]
+enum LaunchError {
+    Configuration(config::ConfigError),
+    Server(server::ServerError),
+}
+
+impl From<config::ConfigError> for LaunchError {
+    fn from(error: config::ConfigError) -> Self {
+        Self::Configuration(error)
+    }
+}
+
+impl From<server::ServerError> for LaunchError {
+    fn from(error: server::ServerError) -> Self {
+        Self::Server(error)
+    }
+}
+
+impl fmt::Display for LaunchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Configuration(error) => error.fmt(formatter),
+            Self::Server(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for LaunchError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Configuration(error) => Some(error),
+            Self::Server(error) => Some(error),
+        }
+    }
 }
 
 fn launch_mode(mode: &str, _configuration: impl std::fmt::Debug) {

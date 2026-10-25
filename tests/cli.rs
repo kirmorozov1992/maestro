@@ -1,7 +1,9 @@
 use std::{
     path::PathBuf,
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
+    thread,
+    time::{Duration, Instant},
 };
 
 static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
@@ -38,7 +40,7 @@ fn help_lists_the_supported_commands() {
 
 #[test]
 fn commands_run_as_placeholders() {
-    for command in ["server", "agent", "submit", "status", "stop"] {
+    for command in ["agent", "submit", "status", "stop"] {
         let output = run_cli(&[command]);
         let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -98,6 +100,91 @@ fn agent_help_shows_config_options_and_defaults() {
 }
 
 #[test]
+fn server_help_shows_scheduler_timeouts_and_defaults() {
+    let output = run_cli(&["server", "--help"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    for expected in [
+        "--assignment-timeout-secs",
+        "MAESTRO_ASSIGNMENT_TIMEOUT_SECS",
+        "30",
+        "--scheduler-interval-secs",
+        "MAESTRO_SCHEDULER_INTERVAL_SECS",
+        "1",
+    ] {
+        assert!(stdout.contains(expected), "help is missing {expected}");
+    }
+}
+
+#[test]
+fn server_rejects_invalid_scheduler_timeout_environment_values_safely() {
+    for (variable, value) in [
+        ("MAESTRO_ASSIGNMENT_TIMEOUT_SECS", "not-a-duration"),
+        ("MAESTRO_SCHEDULER_INTERVAL_SECS", "not-a-duration"),
+    ] {
+        let output = run_cli_with_env(&["server"], &[(variable, value)]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(!output.status.success(), "{variable} was ignored");
+        assert!(stderr.contains(&format!("invalid value for {variable}")));
+        assert!(!stderr.contains(value));
+    }
+}
+
+#[test]
+fn server_cli_values_override_invalid_environment_values() {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_maestro"));
+    command
+        .env_clear()
+        .env("MAESTRO_BIND_ADDR", "not-a-socket")
+        .env("MAESTRO_ASSIGNMENT_TIMEOUT_SECS", "not-a-duration")
+        .env("MAESTRO_SCHEDULER_INTERVAL_SECS", "not-a-duration")
+        .args([
+            "server",
+            "--bind-addr",
+            "127.0.0.1:0",
+            "--assignment-timeout-secs",
+            "2",
+            "--scheduler-interval-secs",
+            "1",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("server process should start");
+    let deadline = Instant::now() + Duration::from_secs(2);
+
+    let stayed_running = loop {
+        if child
+            .try_wait()
+            .expect("server process should be observable")
+            .is_some()
+        {
+            break false;
+        }
+        if Instant::now() >= deadline {
+            break true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    if stayed_running {
+        child.kill().expect("test server should be stoppable");
+        child.wait().expect("test server should exit after kill");
+    } else {
+        let output = child
+            .wait_with_output()
+            .expect("early server exit output should be readable");
+        panic!(
+            "server exited before CLI overrides were applied: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    assert!(stayed_running);
+}
+
+#[test]
 fn commands_accept_their_configuration_options() {
     let temp_dir = std::env::temp_dir().to_string_lossy().into_owned();
     let agent_args = [
@@ -111,16 +198,7 @@ fn commands_accept_their_configuration_options() {
         "--working-dir",
         temp_dir.as_str(),
     ];
-    let server_args = [
-        "server",
-        "--bind-addr",
-        "127.0.0.1:9001",
-        "--liveness-timeout-secs",
-        "20",
-    ];
-
     assert!(run_cli(&agent_args).status.success());
-    assert!(run_cli(&server_args).status.success());
     for command in ["submit", "status", "stop"] {
         assert!(
             run_cli(&[command, "--server-addr", "127.0.0.1:9002"])

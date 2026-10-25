@@ -52,18 +52,10 @@ impl Error for SchedulerError {
 }
 
 impl Scheduler {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "M4.5 server loop will construct the scheduler")
-    )]
     pub(crate) fn new(store: StateStore) -> Self {
         Self { store }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "M4.5 server loop will invoke scheduler ticks")
-    )]
     pub(crate) fn tick(
         &self,
         now: Timestamp,

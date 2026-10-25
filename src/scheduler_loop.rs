@@ -25,13 +25,6 @@ pub(crate) enum SchedulerLoopError {
     WorkerPanicked,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "M5.2 server startup will control the scheduler loop"
-    )
-)]
 impl SchedulerLoop {
     pub(crate) fn new(interval: Duration) -> Result<Self, SchedulerLoopError> {
         if interval.is_zero() {
