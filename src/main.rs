@@ -3,6 +3,7 @@ mod config;
 pub mod domain;
 pub mod error;
 mod scheduler;
+mod scheduler_loop;
 pub(crate) mod state;
 mod transport;
 mod worker;

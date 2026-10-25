@@ -609,6 +609,31 @@ impl StateStore {
         Ok(AssignmentStartOutcome::Started)
     }
 
+    pub(crate) fn expire_assignments(
+        &self,
+        now: Timestamp,
+        timeout: Duration,
+    ) -> Result<Vec<AllocationId>, StateStoreError> {
+        let mut state = self.lock()?;
+        let mut expired_allocations = state
+            .allocations
+            .values()
+            .filter(|allocation| {
+                allocation.status() == AllocationStatus::Assigned
+                    && assignment_expired(now, allocation.assigned_at(), timeout)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        expired_allocations.sort_by_key(Allocation::id);
+
+        let mut expired_ids = Vec::with_capacity(expired_allocations.len());
+        for allocation in expired_allocations {
+            expire_assignment(&mut state, &allocation, now)?;
+            expired_ids.push(allocation.id());
+        }
+        Ok(expired_ids)
+    }
+
     #[cfg_attr(
         not(test),
         expect(
@@ -1195,6 +1220,81 @@ mod tests {
             store.list_pending_jobs(),
             Err(StateStoreError::InvariantViolation { .. })
         ));
+    }
+
+    #[test]
+    fn expire_assignments_marks_due_assignment_lost_and_releases_reservation() {
+        let store = StateStore::default();
+        let job_id = job_id(1);
+        let allocation_id = allocation_id(1);
+        let agent_id = agent_id(1);
+        store.create_job(job(job_id, 100)).unwrap();
+        store.register_agent(agent(agent_id, 100)).unwrap();
+        store
+            .assign_allocation(allocation(allocation_id, job_id, agent_id, 200))
+            .unwrap();
+
+        let expired = store
+            .expire_assignments(Timestamp::from_unix_millis(300), Duration::from_millis(100))
+            .unwrap();
+
+        assert_eq!(expired, vec![allocation_id]);
+        assert_eq!(store.get_job(job_id).unwrap().status(), JobStatus::Lost);
+        assert_eq!(
+            store.get_allocation(allocation_id).unwrap().status(),
+            AllocationStatus::Lost
+        );
+        assert_eq!(
+            store.get_agent(agent_id).unwrap().availability(),
+            AgentAvailability::Idle
+        );
+        assert!(store.list_queued_assignments(agent_id).unwrap().is_empty());
+        assert!(
+            store
+                .expire_assignments(Timestamp::from_unix_millis(400), Duration::from_millis(100))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn expire_assignments_keeps_live_and_started_allocations_unchanged() {
+        let store = StateStore::default();
+        let job_id = job_id(1);
+        let allocation_id = allocation_id(1);
+        let agent_id = agent_id(1);
+        store.create_job(job(job_id, 100)).unwrap();
+        store.register_agent(agent(agent_id, 100)).unwrap();
+        store
+            .assign_allocation(allocation(allocation_id, job_id, agent_id, 200))
+            .unwrap();
+
+        assert!(
+            store
+                .expire_assignments(Timestamp::from_unix_millis(299), Duration::from_millis(100))
+                .unwrap()
+                .is_empty()
+        );
+        start(&store, job_id, allocation_id, agent_id, 250);
+
+        assert!(
+            store
+                .expire_assignments(
+                    Timestamp::from_unix_millis(1_000),
+                    Duration::from_millis(100)
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.get_job(job_id).unwrap().status(), JobStatus::Running);
+        assert_eq!(
+            store.get_allocation(allocation_id).unwrap().status(),
+            AllocationStatus::Running
+        );
+        assert_eq!(
+            store.get_agent(agent_id).unwrap().availability(),
+            AgentAvailability::Busy
+        );
     }
 
     #[test]
