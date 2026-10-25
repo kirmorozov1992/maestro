@@ -107,15 +107,21 @@ pub(crate) fn select_agent(agents: &[Agent]) -> Option<AgentId> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Scheduler, TickOutcome, select_agent};
+    use super::{Scheduler, SchedulerError, TickOutcome, select_agent};
     use crate::{
         domain::{
-            Agent, AgentAvailability, AgentId, Allocation, AllocationId, AllocationStatus, Job,
-            JobId, JobSpec, JobStatus, Timestamp,
+            Agent, AgentAvailability, AgentHealth, AgentId, Allocation, AllocationId,
+            AllocationStatus, Job, JobId, JobSpec, JobStatus, Timestamp,
         },
-        state::store::StateStore,
+        state::{error::StateStoreError, store::StateStore},
     };
-    use std::{collections::BTreeMap, num::NonZeroU32, time::Duration};
+    use std::{
+        collections::BTreeMap,
+        num::NonZeroU32,
+        sync::{Arc, Barrier},
+        thread,
+        time::Duration,
+    };
 
     fn job_id(suffix: u32) -> JobId {
         format!("00000000-0000-4000-8000-{suffix:012x}")
@@ -255,6 +261,13 @@ mod tests {
             store.list_queued_assignments(agent_id(9)).unwrap(),
             Vec::new()
         );
+
+        let next_result = scheduler
+            .tick(Timestamp::from_unix_millis(301), Duration::from_secs(30))
+            .unwrap();
+        let (next_job_id, next_agent_id, _) = id_tick(next_result);
+        assert_eq!(next_job_id, second_job_id);
+        assert_eq!(next_agent_id, agent_id(9));
     }
 
     #[test]
@@ -283,6 +296,9 @@ mod tests {
         let mut busy = agent(1, 100);
         busy.set_availability(AgentAvailability::Busy);
         store.register_agent(busy).unwrap();
+        let mut unhealthy = agent(2, 100);
+        unhealthy.mark_unhealthy();
+        store.register_agent(unhealthy).unwrap();
         let scheduler = Scheduler::new(store.clone());
 
         assert_eq!(
@@ -300,6 +316,95 @@ mod tests {
             store.get_agent(agent_id(1)).unwrap().availability(),
             AgentAvailability::Busy
         );
+        assert_eq!(
+            store.get_agent(agent_id(2)).unwrap().health(),
+            AgentHealth::Unhealthy
+        );
+    }
+
+    #[test]
+    fn tick_keeps_job_pending_when_no_agents_are_registered() {
+        let store = StateStore::default();
+        let pending_id = job_id(1);
+        store.create_job(job(pending_id, 100)).unwrap();
+        let scheduler = Scheduler::new(store.clone());
+
+        assert_eq!(
+            scheduler
+                .tick(Timestamp::from_unix_millis(200), Duration::from_secs(30))
+                .unwrap(),
+            TickOutcome::NoEligibleAgent
+        );
+        assert_eq!(
+            store.get_job(pending_id).unwrap().status(),
+            JobStatus::Pending
+        );
+        assert_eq!(store.list_pending_jobs().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn concurrent_ticks_assign_a_pending_job_at_most_once() {
+        let store = StateStore::default();
+        let pending_id = job_id(1);
+        store.create_job(job(pending_id, 100)).unwrap();
+        store.register_agent(agent(1, 100)).unwrap();
+        store.register_agent(agent(2, 100)).unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let workers = (0..2)
+            .map(|_| {
+                let store = store.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let scheduler = Scheduler::new(store);
+                    barrier.wait();
+                    scheduler.tick(Timestamp::from_unix_millis(200), Duration::from_secs(30))
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("scheduler worker should finish"))
+            .collect::<Vec<_>>();
+        let assignments = outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                Ok(TickOutcome::Assigned(assignment)) => Some(*assignment),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].job_id(), pending_id);
+        assert_eq!(
+            store.get_job(pending_id).unwrap().status(),
+            JobStatus::Assigned
+        );
+        assert_eq!(
+            store
+                .get_allocation_for_job(pending_id)
+                .unwrap()
+                .unwrap()
+                .status(),
+            AllocationStatus::Assigned
+        );
+        let queued_assignments = store.list_queued_assignments(agent_id(1)).unwrap().len()
+            + store.list_queued_assignments(agent_id(2)).unwrap().len();
+        assert_eq!(queued_assignments, 1);
+
+        for outcome in outcomes {
+            match outcome {
+                Ok(TickOutcome::Assigned(_)) | Ok(TickOutcome::NoPendingJobs) => {}
+                Err(SchedulerError::StateStore(StateStoreError::Conflict {
+                    resource: "job",
+                    id,
+                    ..
+                })) => assert_eq!(id, pending_id.to_string()),
+                other => panic!("unexpected concurrent scheduler outcome: {other:?}"),
+            }
+        }
     }
 
     #[test]
