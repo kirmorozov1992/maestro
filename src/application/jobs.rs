@@ -1,8 +1,8 @@
 use super::map_store_error;
 use crate::{
     domain::{
-        AgentId, Allocation, AllocationId, ApplyOutcome, Job, JobEvent, JobId, JobSnapshot,
-        JobSpec, JobSpecError, JobStatus, StopReason, Timestamp,
+        AgentId, Allocation, AllocationId, AllocationSnapshot, ApplyOutcome, Job, JobEvent, JobId,
+        JobSnapshot, JobSpec, JobSpecError, JobStatus, StopReason, Timestamp,
     },
     error::AppError,
     state::{error::StateStoreError, store::StateStore},
@@ -15,6 +15,12 @@ pub(crate) struct JobSubmission {
     pub(crate) args: Vec<String>,
     pub(crate) env: Option<BTreeMap<String, String>>,
     pub(crate) working_dir: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct JobDetails {
+    pub(crate) job: JobSnapshot,
+    pub(crate) allocation: Option<AllocationSnapshot>,
 }
 
 #[derive(Clone)]
@@ -70,10 +76,29 @@ impl JobsService {
         Ok(JobSnapshot::from(&job))
     }
 
+    pub(crate) fn get_job_details(&self, id: JobId) -> Result<JobDetails, AppError> {
+        let (job, allocation) = self
+            .store
+            .get_job_with_allocation(id)
+            .map_err(map_store_error)?;
+        Ok(job_details(&job, allocation.as_ref()))
+    }
+
     pub(crate) fn list_jobs(&self) -> Result<Vec<JobSnapshot>, AppError> {
         self.store
             .list_jobs()
             .map(|jobs| jobs.iter().map(JobSnapshot::from).collect())
+            .map_err(map_store_error)
+    }
+
+    pub(crate) fn list_job_details(&self) -> Result<Vec<JobDetails>, AppError> {
+        self.store
+            .list_jobs_with_allocations()
+            .map(|jobs| {
+                jobs.iter()
+                    .map(|(job, allocation)| job_details(job, allocation.as_ref()))
+                    .collect()
+            })
             .map_err(map_store_error)
     }
 
@@ -113,6 +138,13 @@ impl JobsService {
                 AppError::conflict(format!("job `{id}` is already terminal")),
             ),
         }
+    }
+}
+
+fn job_details(job: &Job, allocation: Option<&Allocation>) -> JobDetails {
+    JobDetails {
+        job: JobSnapshot::from(job),
+        allocation: allocation.map(AllocationSnapshot::from),
     }
 }
 

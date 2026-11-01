@@ -1,13 +1,26 @@
 use crate::{
-    application::{AgentsService, JobsService},
+    application::{AgentsService, JobDetails, JobsService, StopOutcome},
     config::ServerConfig,
     domain::Timestamp,
+    error::{AppError, ErrorKind},
     scheduler::{Scheduler, SchedulerError},
     scheduler_loop::{SchedulerLoop, SchedulerLoopError},
     state::store::StateStore,
-    transport::v1::HealthResponse,
+    transport::v1::{
+        CreateJobRequest, ErrorResponse, HealthResponse, JobListResponse, JobResponse,
+        StopJobResponse,
+    },
 };
-use axum::{Json, Router, extract::State, routing::get};
+use axum::{
+    Json, Router,
+    extract::{
+        Path, State,
+        rejection::{JsonRejection, PathRejection},
+    },
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
 use std::{
     error::Error,
     fmt,
@@ -58,7 +71,7 @@ impl Error for ServerError {
 
 #[expect(
     dead_code,
-    reason = "M5.3 and M5.4 handlers will use these shared application services"
+    reason = "M5.4 agent handlers will use the remaining shared application service"
 )]
 struct ServerState {
     jobs: JobsService,
@@ -136,11 +149,139 @@ fn server_state(store: StateStore, assignment_timeout: Duration) -> Arc<ServerSt
 fn router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/v1/jobs", get(list_jobs).post(create_job))
+        .route("/v1/jobs/{job_id}", get(get_job))
+        .route("/v1/jobs/{job_id}/stop", post(stop_job))
         .with_state(state)
 }
 
 async fn health(State(_state): State<Arc<ServerState>>) -> Json<HealthResponse> {
     Json(HealthResponse::ok())
+}
+
+async fn create_job(
+    State(state): State<Arc<ServerState>>,
+    request: Result<Json<CreateJobRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => return json_rejection_response(rejection),
+    };
+    let submitted_at = match current_timestamp() {
+        Ok(timestamp) => timestamp,
+        Err(reason) => return clock_error_response(reason),
+    };
+    match state
+        .jobs
+        .submit_job(request.into_submission(), submitted_at)
+    {
+        Ok(job) => (
+            StatusCode::CREATED,
+            Json(JobResponse::from_parts(&job, None)),
+        )
+            .into_response(),
+        Err(error) => app_error_response(error),
+    }
+}
+
+async fn list_jobs(State(state): State<Arc<ServerState>>) -> Response {
+    match state.jobs.list_job_details() {
+        Ok(jobs) => {
+            let items = jobs.iter().map(job_response).collect();
+            (StatusCode::OK, Json(JobListResponse { items })).into_response()
+        }
+        Err(error) => app_error_response(error),
+    }
+}
+
+async fn get_job(
+    State(state): State<Arc<ServerState>>,
+    path: Result<Path<String>, PathRejection>,
+) -> Response {
+    let Path(id) = match path {
+        Ok(path) => path,
+        Err(_) => return invalid_job_id_response(),
+    };
+    let id = match id.parse() {
+        Ok(id) => id,
+        Err(_) => return invalid_job_id_response(),
+    };
+    match state.jobs.get_job_details(id) {
+        Ok(job) => (StatusCode::OK, Json(job_response(&job))).into_response(),
+        Err(error) => app_error_response(error),
+    }
+}
+
+async fn stop_job(
+    State(state): State<Arc<ServerState>>,
+    path: Result<Path<String>, PathRejection>,
+) -> Response {
+    let Path(id) = match path {
+        Ok(path) => path,
+        Err(_) => return invalid_job_id_response(),
+    };
+    let id = match id.parse() {
+        Ok(id) => id,
+        Err(_) => return invalid_job_id_response(),
+    };
+    let stopped_at = match current_timestamp() {
+        Ok(timestamp) => timestamp,
+        Err(reason) => return clock_error_response(reason),
+    };
+    match state.jobs.stop_job(id, stopped_at) {
+        Ok(outcome) => {
+            let status = match outcome {
+                StopOutcome::Completed(_) => StatusCode::OK,
+                StopOutcome::Requested(_) => StatusCode::ACCEPTED,
+            };
+            (status, Json(StopJobResponse::from(outcome))).into_response()
+        }
+        Err(error) => app_error_response(error),
+    }
+}
+
+fn job_response(details: &JobDetails) -> JobResponse {
+    JobResponse::from_parts(&details.job, details.allocation.as_ref())
+}
+
+fn invalid_job_id_response() -> Response {
+    app_error_response(AppError::invalid_input("job ID path is invalid"))
+}
+
+fn json_rejection_response(rejection: JsonRejection) -> Response {
+    let status = rejection.status();
+    let error = if status.is_server_error() {
+        AppError::internal(
+            "request JSON could not be decoded",
+            io::Error::other("JSON extractor failed"),
+        )
+    } else {
+        AppError::invalid_input("request JSON is invalid")
+    };
+    error_response(status, &error)
+}
+
+fn clock_error_response(reason: &'static str) -> Response {
+    app_error_response(AppError::internal(
+        "server clock is unavailable",
+        io::Error::other(reason),
+    ))
+}
+
+fn app_error_response(error: AppError) -> Response {
+    let status = match error.kind() {
+        ErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
+        ErrorKind::NotFound => StatusCode::NOT_FOUND,
+        ErrorKind::Conflict => StatusCode::CONFLICT,
+        ErrorKind::Internal | ErrorKind::Transport | ErrorKind::Process => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    error_response(status, &error)
+}
+
+fn error_response(status: StatusCode, error: &AppError) -> Response {
+    (status, Json(ErrorResponse::from(error))).into_response()
 }
 
 fn current_timestamp() -> Result<Timestamp, &'static str> {
@@ -227,13 +368,14 @@ mod tests {
         scheduler::Scheduler,
         state::store::StateStore,
     };
+    use serde_json::{Value, json};
     use std::{
         io::{Read, Write},
         net::SocketAddr,
         num::NonZeroU32,
         time::Duration,
     };
-    use tokio::{net::TcpListener, sync::oneshot};
+    use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
     fn config() -> ServerConfig {
         ServerConfig {
@@ -282,6 +424,73 @@ mod tests {
         (store, job_id)
     }
 
+    async fn start_test_router(
+        store: StateStore,
+    ) -> (
+        SocketAddr,
+        oneshot::Sender<()>,
+        JoinHandle<Result<(), std::io::Error>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener.local_addr().expect("listener has an address");
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                super::router(super::server_state(store, Duration::from_secs(30))),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_receiver.await;
+            })
+            .await
+        });
+        (address, shutdown_sender, server)
+    }
+
+    async fn http_request(address: SocketAddr, method: &str, path: &str, body: &str) -> String {
+        let method = method.to_owned();
+        let path = path.to_owned();
+        let body = body.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut stream = std::net::TcpStream::connect(address)
+                .expect("test server should accept the request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout should be set");
+            write!(
+                stream,
+                "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("request should be written");
+            let mut response = String::new();
+            stream
+                .read_to_string(&mut response)
+                .expect("response should finish");
+            response
+        })
+        .await
+        .expect("blocking HTTP client should complete")
+    }
+
+    fn response_status(response: &str) -> u16 {
+        response
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|status| status.parse().ok())
+            .expect("response should have an HTTP status")
+    }
+
+    fn response_json(response: &str) -> Value {
+        let (_, body) = response
+            .split_once("\r\n\r\n")
+            .expect("response should contain headers and body");
+        serde_json::from_str(body).expect("response should contain JSON")
+    }
+
     #[tokio::test]
     async fn serves_health_and_gracefully_stops_the_scheduler() {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -324,6 +533,154 @@ mod tests {
             .await
             .expect("server task should finish")
             .expect("server should stop cleanly");
+    }
+
+    #[tokio::test]
+    async fn jobs_http_routes_create_list_and_get_safe_job_responses() {
+        let (address, shutdown_sender, server) = start_test_router(StateStore::default()).await;
+        let create = http_request(
+            address,
+            "POST",
+            "/v1/jobs",
+            r#"{"command":"echo","args":["hello"],"env":{"TOKEN":"must-not-leak"}}"#,
+        )
+        .await;
+
+        assert_eq!(response_status(&create), 201);
+        let created = response_json(&create);
+        let job_id = created["id"]
+            .as_str()
+            .expect("created response should include job ID");
+        assert_eq!(created["status"], "pending");
+        assert_eq!(created["spec"]["env_keys"], json!(["TOKEN"]));
+        assert!(!create.contains("must-not-leak"));
+
+        let list = http_request(address, "GET", "/v1/jobs", "").await;
+        assert_eq!(response_status(&list), 200);
+        assert_eq!(response_json(&list)["items"][0]["id"], job_id);
+
+        let path = format!("/v1/jobs/{job_id}");
+        let get = http_request(address, "GET", &path, "").await;
+        assert_eq!(response_status(&get), 200);
+        assert_eq!(response_json(&get)["id"], job_id);
+
+        shutdown_sender
+            .send(())
+            .expect("test server should still be running");
+        server
+            .await
+            .expect("test server task should finish")
+            .expect("test router should stop cleanly");
+    }
+
+    #[tokio::test]
+    async fn jobs_http_routes_return_safe_input_and_lookup_errors() {
+        let (address, shutdown_sender, server) = start_test_router(StateStore::default()).await;
+        let malformed = http_request(
+            address,
+            "POST",
+            "/v1/jobs",
+            r#"{"command":"private-marker", broken}"#,
+        )
+        .await;
+        assert_eq!(response_status(&malformed), 400);
+        assert_eq!(response_json(&malformed)["code"], "invalid_input");
+        assert!(!malformed.contains("private-marker"));
+
+        let invalid_spec = http_request(address, "POST", "/v1/jobs", r#"{"command":"  "}"#).await;
+        assert_eq!(response_status(&invalid_spec), 400);
+        assert_eq!(response_json(&invalid_spec)["code"], "invalid_input");
+
+        let unknown_field = http_request(
+            address,
+            "POST",
+            "/v1/jobs",
+            r#"{"command":"echo","private_field":"must-not-leak"}"#,
+        )
+        .await;
+        assert_eq!(response_status(&unknown_field), 422);
+        assert_eq!(response_json(&unknown_field)["code"], "invalid_input");
+        assert!(!unknown_field.contains("must-not-leak"));
+
+        let invalid_id = http_request(address, "GET", "/v1/jobs/not-a-uuid", "").await;
+        assert_eq!(response_status(&invalid_id), 400);
+        assert_eq!(response_json(&invalid_id)["code"], "invalid_input");
+
+        let unknown_id = http_request(
+            address,
+            "GET",
+            "/v1/jobs/00000000-0000-4000-8000-000000000099",
+            "",
+        )
+        .await;
+        assert_eq!(response_status(&unknown_id), 404);
+        assert_eq!(response_json(&unknown_id)["code"], "not_found");
+
+        shutdown_sender
+            .send(())
+            .expect("test server should still be running");
+        server
+            .await
+            .expect("test server task should finish")
+            .expect("test router should stop cleanly");
+    }
+
+    #[tokio::test]
+    async fn jobs_http_stop_maps_completed_requested_and_conflict_outcomes() {
+        let (address, shutdown_sender, server) = start_test_router(StateStore::default()).await;
+        let create = http_request(address, "POST", "/v1/jobs", r#"{"command":"echo"}"#).await;
+        let pending_job_id = response_json(&create)["id"]
+            .as_str()
+            .expect("created job should have an ID")
+            .to_owned();
+
+        let stop_path = format!("/v1/jobs/{pending_job_id}/stop");
+        let completed = http_request(address, "POST", &stop_path, "").await;
+        assert_eq!(response_status(&completed), 200);
+        assert_eq!(response_json(&completed)["outcome"], "completed");
+        assert_eq!(response_json(&completed)["job"]["status"], "stopped");
+
+        let conflict = http_request(address, "POST", &stop_path, "").await;
+        assert_eq!(response_status(&conflict), 409);
+        assert_eq!(response_json(&conflict)["code"], "conflict");
+
+        shutdown_sender
+            .send(())
+            .expect("test server should still be running");
+        server
+            .await
+            .expect("test server task should finish")
+            .expect("test router should stop cleanly");
+
+        let (assigned_store, assigned_job_id) = assigned_store();
+        let store_snapshot = assigned_store.clone();
+        let (address, shutdown_sender, server) = start_test_router(assigned_store).await;
+        let assigned_path = format!("/v1/jobs/{assigned_job_id}");
+        let assigned = http_request(address, "GET", &assigned_path, "").await;
+        assert_eq!(response_status(&assigned), 200);
+        assert_eq!(response_json(&assigned)["status"], "assigned");
+        assert_eq!(response_json(&assigned)["allocation"]["status"], "assigned");
+
+        let stop_path = format!("/v1/jobs/{assigned_job_id}/stop");
+        let requested = http_request(address, "POST", &stop_path, "").await;
+        assert_eq!(response_status(&requested), 202);
+        assert_eq!(response_json(&requested)["outcome"], "requested");
+        assert_eq!(
+            response_json(&requested)["job_id"],
+            assigned_job_id.to_string()
+        );
+        assert_eq!(
+            store_snapshot.get_job(assigned_job_id).unwrap().status(),
+            JobStatus::Assigned
+        );
+
+        shutdown_sender
+            .send(())
+            .expect("test server should still be running");
+        server
+            .await
+            .expect("test server task should finish")
+            .expect("test router should stop cleanly");
     }
 
     #[test]

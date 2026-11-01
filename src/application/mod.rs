@@ -12,8 +12,8 @@ pub(crate) use error::map_store_error;
     not(test),
     expect(
         unused_imports,
-        reason = "M5.3 stop handler will map this application request"
+        reason = "transport contract tests use the stop request fixture"
     )
 )]
 pub(crate) use jobs::StopRequest;
-pub(crate) use jobs::{JobSubmission, JobsService, StopOutcome};
+pub(crate) use jobs::{JobDetails, JobSubmission, JobsService, StopOutcome};

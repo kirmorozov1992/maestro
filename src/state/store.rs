@@ -103,6 +103,48 @@ impl StateStore {
         Ok(jobs)
     }
 
+    pub(crate) fn get_job_with_allocation(
+        &self,
+        id: JobId,
+    ) -> Result<(Job, Option<Allocation>), StateStoreError> {
+        let state = self.lock()?;
+        let job = state
+            .jobs
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| StateStoreError::not_found("job", id))?;
+        let allocation = state
+            .allocations
+            .values()
+            .find(|allocation| allocation.job_id() == id)
+            .cloned();
+        Ok((job, allocation))
+    }
+
+    pub(crate) fn list_jobs_with_allocations(
+        &self,
+    ) -> Result<Vec<(Job, Option<Allocation>)>, StateStoreError> {
+        let (mut jobs, allocations) = {
+            let state = self.lock()?;
+            (
+                state.jobs.values().cloned().collect::<Vec<_>>(),
+                state.allocations.values().cloned().collect::<Vec<_>>(),
+            )
+        };
+        jobs.sort_by_key(|job| (job.submitted_at(), job.id()));
+
+        Ok(jobs
+            .into_iter()
+            .map(|job| {
+                let allocation = allocations
+                    .iter()
+                    .find(|allocation| allocation.job_id() == job.id())
+                    .cloned();
+                (job, allocation)
+            })
+            .collect())
+    }
+
     pub(crate) fn list_pending_jobs(&self) -> Result<Vec<Job>, StateStoreError> {
         let state = self.lock()?;
         let pending_count = state
@@ -1866,6 +1908,51 @@ mod tests {
         let store = StateStore::default();
 
         let error = store.get_allocation_for_job(job_id(99)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StateStoreError::NotFound {
+                resource: "job",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn job_views_return_job_and_optional_allocation_in_deterministic_order() {
+        let (store, assigned_job_id, allocation_id, _) = store_with_allocation();
+        let pending = job(job_id(2), 50);
+        store.create_job(pending.clone()).unwrap();
+        let assigned_job = store.get_job(assigned_job_id).unwrap();
+        let assigned_allocation = store.get_allocation(allocation_id).unwrap();
+
+        let views = store.list_jobs_with_allocations().unwrap();
+
+        assert_eq!(
+            views,
+            vec![
+                (pending, None),
+                (assigned_job, Some(assigned_allocation.clone()))
+            ]
+        );
+        assert_eq!(
+            store.get_job_with_allocation(assigned_job_id).unwrap(),
+            (
+                store.get_job(assigned_job_id).unwrap(),
+                Some(assigned_allocation)
+            )
+        );
+        assert_eq!(
+            store.get_job_with_allocation(job_id(2)).unwrap(),
+            (store.get_job(job_id(2)).unwrap(), None)
+        );
+    }
+
+    #[test]
+    fn get_job_with_allocation_rejects_unknown_job() {
+        let store = StateStore::default();
+
+        let error = store.get_job_with_allocation(job_id(99)).unwrap_err();
 
         assert!(matches!(
             error,
