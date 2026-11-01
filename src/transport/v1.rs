@@ -33,26 +33,26 @@ impl CreateJobRequest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RegisterAgentRequest {
     pub(crate) address: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ProcessResultV1 {
     Exited { exit_code: i32 },
     SpawnFailed,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StopReasonV1 {
     UserRequested,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum AllocationEventRequest {
     Started {
@@ -120,7 +120,7 @@ impl AllocationEventRequest {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum JobStatusV1 {
     Pending,
@@ -146,7 +146,7 @@ impl From<DomainJobStatus> for JobStatusV1 {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AllocationStatusV1 {
     Assigned,
@@ -170,7 +170,7 @@ impl From<DomainAllocationStatus> for AllocationStatusV1 {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AgentHealthV1 {
     Healthy,
@@ -186,7 +186,7 @@ impl From<DomainAgentHealth> for AgentHealthV1 {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AgentAvailabilityV1 {
     Idle,
@@ -202,7 +202,7 @@ impl From<DomainAgentAvailability> for AgentAvailabilityV1 {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum TerminalResultV1 {
     Exited { exit_code: i32 },
@@ -222,7 +222,7 @@ impl From<TerminalResult> for TerminalResultV1 {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct JobSpecResponse {
     pub(crate) command: String,
     pub(crate) args: Vec<String>,
@@ -243,7 +243,7 @@ impl From<&JobSpec> for JobSpecResponse {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct JobDataResponse {
     pub(crate) id: JobId,
     pub(crate) spec: JobSpecResponse,
@@ -270,7 +270,7 @@ impl From<&JobSnapshot> for JobDataResponse {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct AllocationResponse {
     pub(crate) id: AllocationId,
     pub(crate) job_id: JobId,
@@ -318,7 +318,7 @@ pub(crate) struct JobListResponse {
     pub(crate) items: Vec<JobResponse>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct AgentResponse {
     pub(crate) id: AgentId,
     pub(crate) address: String,
@@ -339,7 +339,7 @@ impl From<&AgentSnapshot> for AgentResponse {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct AssignmentResponse {
     pub(crate) job: JobDataResponse,
     pub(crate) allocation: AllocationResponse,
@@ -382,7 +382,7 @@ impl From<StopOutcome> for StopJobResponse {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum EventOutcomeV1 {
     Applied,
@@ -400,7 +400,7 @@ impl From<ApplyOutcome> for EventOutcomeV1 {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct EventReportResponse {
     pub(crate) outcome: EventOutcomeV1,
 }
@@ -432,13 +432,13 @@ impl HealthResponse {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct FieldError {
     pub(crate) field: FieldNameV1,
     pub(crate) code: FieldErrorCodeV1,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FieldNameV1 {
     Command,
@@ -447,7 +447,7 @@ pub(crate) enum FieldNameV1 {
     WorkingDir,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FieldErrorCodeV1 {
     EmptyCommand,
@@ -484,12 +484,12 @@ impl From<JobSpecError> for FieldError {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ErrorDetails {
     pub(crate) field_errors: Vec<FieldError>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ErrorResponse {
     pub(crate) code: String,
     pub(crate) message: String,
