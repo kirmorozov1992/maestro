@@ -15,7 +15,7 @@ use crate::{
 use axum::{
     Json, Router,
     extract::{
-        Path, State,
+        DefaultBodyLimit, Path, State,
         rejection::{JsonRejection, PathRejection},
     },
     http::StatusCode,
@@ -75,6 +75,8 @@ struct ServerState {
     agents: AgentsService,
     assignment_timeout: Duration,
 }
+
+const MAX_JSON_REQUEST_BODY_BYTES: usize = 1_048_576;
 
 pub(crate) fn run(config: ServerConfig) -> Result<(), ServerError> {
     initialize_logging()?;
@@ -159,6 +161,7 @@ fn router(state: Arc<ServerState>) -> Router {
             "/v1/allocations/{allocation_id}/events",
             post(report_allocation_event),
         )
+        .layer(DefaultBodyLimit::max(MAX_JSON_REQUEST_BODY_BYTES))
         .with_state(state)
 }
 
@@ -649,8 +652,19 @@ mod tests {
     }
 
     async fn http_request(address: SocketAddr, method: &str, path: &str, body: &str) -> String {
+        http_request_with_content_type(address, method, path, "application/json", body).await
+    }
+
+    async fn http_request_with_content_type(
+        address: SocketAddr,
+        method: &str,
+        path: &str,
+        content_type: &str,
+        body: &str,
+    ) -> String {
         let method = method.to_owned();
         let path = path.to_owned();
+        let content_type = content_type.to_owned();
         let body = body.to_owned();
         tokio::task::spawn_blocking(move || {
             let mut stream = std::net::TcpStream::connect(address)
@@ -660,7 +674,7 @@ mod tests {
                 .expect("read timeout should be set");
             write!(
                 stream,
-                "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             )
             .expect("request should be written");
@@ -780,6 +794,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn json_body_limit_accepts_exact_limit_and_rejects_one_byte_over_safely() {
+        const EXPECTED_LIMIT_BYTES: usize = 1_048_576;
+        let (address, shutdown_sender, server) = start_test_router(StateStore::default()).await;
+        let valid_json = r#"{"command":"echo","args":["request-marker"]}"#;
+        let body_at_limit = format!(
+            "{valid_json}{}",
+            " ".repeat(EXPECTED_LIMIT_BYTES - valid_json.len())
+        );
+        let body_over_limit = format!("{body_at_limit} ");
+
+        let at_limit = http_request(address, "POST", "/v1/jobs", &body_at_limit).await;
+        assert_eq!(response_status(&at_limit), 201);
+
+        let over_limit = http_request(address, "POST", "/v1/jobs", &body_over_limit).await;
+        assert_eq!(response_status(&over_limit), 413);
+        assert_eq!(response_json(&over_limit)["code"], "invalid_input");
+        assert!(!over_limit.contains("request-marker"));
+
+        let jobs = http_request(address, "GET", "/v1/jobs", "").await;
+        assert_eq!(response_status(&jobs), 200);
+        assert_eq!(response_json(&jobs)["items"].as_array().unwrap().len(), 1);
+
+        shutdown_sender
+            .send(())
+            .expect("test server should still be running");
+        server
+            .await
+            .expect("test server task should finish")
+            .expect("test router should stop cleanly");
+    }
+
+    #[tokio::test]
     async fn jobs_http_routes_return_safe_input_and_lookup_errors() {
         let (address, shutdown_sender, server) = start_test_router(StateStore::default()).await;
         let malformed = http_request(
@@ -821,6 +867,31 @@ mod tests {
         .await;
         assert_eq!(response_status(&unknown_id), 404);
         assert_eq!(response_json(&unknown_id)["code"], "not_found");
+
+        shutdown_sender
+            .send(())
+            .expect("test server should still be running");
+        server
+            .await
+            .expect("test server task should finish")
+            .expect("test router should stop cleanly");
+    }
+
+    #[tokio::test]
+    async fn json_rejections_preserve_unsupported_media_type_safely() {
+        let (address, shutdown_sender, server) = start_test_router(StateStore::default()).await;
+        let response = http_request_with_content_type(
+            address,
+            "POST",
+            "/v1/jobs",
+            "text/plain",
+            "private-marker",
+        )
+        .await;
+
+        assert_eq!(response_status(&response), 415);
+        assert_eq!(response_json(&response)["code"], "invalid_input");
+        assert!(!response.contains("private-marker"));
 
         shutdown_sender
             .send(())
@@ -932,6 +1003,29 @@ mod tests {
         let malformed = http_request(address, "POST", "/v1/agents/not-a-uuid/heartbeat", "").await;
         assert_eq!(response_status(&malformed), 400);
         assert_eq!(response_json(&malformed)["code"], "invalid_input");
+
+        shutdown_sender
+            .send(())
+            .expect("test server should still be running");
+        server
+            .await
+            .expect("test server task should finish")
+            .expect("test router should stop cleanly");
+    }
+
+    #[tokio::test]
+    async fn agent_routes_return_not_found_for_unknown_agents() {
+        let (address, shutdown_sender, server) = start_test_router(StateStore::default()).await;
+        let unknown_agent_id = AgentId::new();
+        let heartbeat_path = format!("/v1/agents/{unknown_agent_id}/heartbeat");
+        let heartbeat = http_request(address, "POST", &heartbeat_path, "").await;
+        assert_eq!(response_status(&heartbeat), 404);
+        assert_eq!(response_json(&heartbeat)["code"], "not_found");
+
+        let assignment_path = format!("/v1/agents/{unknown_agent_id}/assignments/next");
+        let assignment = http_request(address, "GET", &assignment_path, "").await;
+        assert_eq!(response_status(&assignment), 404);
+        assert_eq!(response_json(&assignment)["code"], "not_found");
 
         shutdown_sender
             .send(())
