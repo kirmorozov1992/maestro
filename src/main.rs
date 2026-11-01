@@ -56,6 +56,8 @@ struct ServerOptions {
 struct AgentOptions {
     #[arg(long, help = config::HELP_SERVER_ADDR)]
     server_addr: Option<SocketAddr>,
+    #[arg(long, help = config::HELP_AGENT_ADDRESS)]
+    agent_address: Option<String>,
     #[arg(
         long,
         value_parser = clap::value_parser!(u64).range(1..),
@@ -128,16 +130,14 @@ fn launch(command: Command, environment: &config::Environment) -> Result<(), Lau
             )?)?;
         }
         Command::Agent(options) => {
-            launch_mode(
-                "agent",
-                config::agent(
-                    options.server_addr,
-                    options.heartbeat_interval_secs,
-                    options.poll_interval_secs,
-                    options.working_dir,
-                    environment,
-                )?,
-            );
+            worker::agent::run(config::agent(
+                options.server_addr,
+                options.agent_address,
+                options.heartbeat_interval_secs,
+                options.poll_interval_secs,
+                options.working_dir,
+                environment,
+            )?)?;
         }
         Command::Submit(options) => {
             launch_mode("submit", config::client(options.server_addr, environment)?);
@@ -154,8 +154,15 @@ fn launch(command: Command, environment: &config::Environment) -> Result<(), Lau
 
 #[derive(Debug)]
 enum LaunchError {
+    Agent(worker::agent::AgentRuntimeError),
     Configuration(config::ConfigError),
     Server(server::ServerError),
+}
+
+impl From<worker::agent::AgentRuntimeError> for LaunchError {
+    fn from(error: worker::agent::AgentRuntimeError) -> Self {
+        Self::Agent(error)
+    }
 }
 
 impl From<config::ConfigError> for LaunchError {
@@ -173,6 +180,7 @@ impl From<server::ServerError> for LaunchError {
 impl fmt::Display for LaunchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Agent(error) => error.fmt(formatter),
             Self::Configuration(error) => error.fmt(formatter),
             Self::Server(error) => error.fmt(formatter),
         }
@@ -182,6 +190,7 @@ impl fmt::Display for LaunchError {
 impl Error for LaunchError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Agent(error) => Some(error),
             Self::Configuration(error) => Some(error),
             Self::Server(error) => Some(error),
         }

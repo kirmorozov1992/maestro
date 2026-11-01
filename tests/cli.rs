@@ -40,13 +40,31 @@ fn help_lists_the_supported_commands() {
 
 #[test]
 fn commands_run_as_placeholders() {
-    for command in ["agent", "submit", "status", "stop"] {
+    for command in ["submit", "status", "stop"] {
         let output = run_cli(&[command]);
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(output.status.success(), "{command} returned an error");
         assert!(stdout.contains(&format!("maestro {command} mode is not implemented yet")));
     }
+}
+
+#[test]
+fn agent_startup_reports_server_unavailable_without_echoing_address() {
+    let address = "private-agent-label:1234";
+    let output = run_cli(&[
+        "agent",
+        "--server-addr",
+        "127.0.0.1:0",
+        "--agent-address",
+        address,
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("agent startup failed"));
+    assert!(!stderr.contains(address));
+    assert!(!stderr.contains("http://"));
 }
 
 #[test]
@@ -87,6 +105,8 @@ fn agent_help_shows_config_options_and_defaults() {
 
     assert!(output.status.success());
     for expected in [
+        "--agent-address",
+        "MAESTRO_AGENT_ADDRESS",
         "--server-addr",
         "--heartbeat-interval-secs",
         "--poll-interval-secs",
@@ -186,19 +206,6 @@ fn server_cli_values_override_invalid_environment_values() {
 
 #[test]
 fn commands_accept_their_configuration_options() {
-    let temp_dir = std::env::temp_dir().to_string_lossy().into_owned();
-    let agent_args = [
-        "agent",
-        "--server-addr",
-        "127.0.0.1:9000",
-        "--heartbeat-interval-secs",
-        "3",
-        "--poll-interval-secs",
-        "2",
-        "--working-dir",
-        temp_dir.as_str(),
-    ];
-    assert!(run_cli(&agent_args).status.success());
     for command in ["submit", "status", "stop"] {
         assert!(
             run_cli(&[command, "--server-addr", "127.0.0.1:9002"])
@@ -243,9 +250,17 @@ fn rejects_zero_intervals_and_invalid_socket_addresses() {
 fn creates_a_missing_agent_working_directory() {
     let working_dir = unique_temp_path();
     let path = working_dir.to_string_lossy().into_owned();
-    let output = run_cli(&["agent", "--working-dir", &path]);
+    let output = run_cli(&[
+        "agent",
+        "--server-addr",
+        "127.0.0.1:0",
+        "--working-dir",
+        &path,
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(output.status.success());
+    assert!(!output.status.success());
+    assert!(stderr.contains("agent startup failed"));
     assert!(working_dir.is_dir());
     std::fs::remove_dir_all(working_dir).expect("test directory should be removable");
 }

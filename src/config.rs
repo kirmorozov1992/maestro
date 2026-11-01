@@ -13,6 +13,7 @@ use std::{
 };
 
 pub(crate) const ENV_SERVER_ADDR: &str = "MAESTRO_SERVER_ADDR";
+pub(crate) const ENV_AGENT_ADDRESS: &str = "MAESTRO_AGENT_ADDRESS";
 pub(crate) const ENV_BIND_ADDR: &str = "MAESTRO_BIND_ADDR";
 pub(crate) const ENV_HEARTBEAT_INTERVAL_SECS: &str = "MAESTRO_HEARTBEAT_INTERVAL_SECS";
 pub(crate) const ENV_POLL_INTERVAL_SECS: &str = "MAESTRO_POLL_INTERVAL_SECS";
@@ -30,6 +31,8 @@ pub(crate) const DEFAULT_SCHEDULER_INTERVAL_SECS: u64 = 1;
 
 pub(crate) const HELP_SERVER_ADDR: &str =
     "Control-plane address (default: 127.0.0.1:8080; env: MAESTRO_SERVER_ADDR)";
+pub(crate) const HELP_AGENT_ADDRESS: &str =
+    "Opaque agent label (env: MAESTRO_AGENT_ADDRESS; default: agent-process-<pid>)";
 pub(crate) const HELP_BIND_ADDR: &str =
     "Bind address (default: 127.0.0.1:8080; env: MAESTRO_BIND_ADDR)";
 pub(crate) const HELP_HEARTBEAT_INTERVAL: &str =
@@ -52,6 +55,7 @@ const DEFAULT_BIND_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr:
 #[derive(Debug, Default)]
 pub(crate) struct Environment {
     server_addr: Option<OsString>,
+    agent_address: Option<OsString>,
     bind_addr: Option<OsString>,
     heartbeat_interval_secs: Option<OsString>,
     poll_interval_secs: Option<OsString>,
@@ -65,6 +69,7 @@ impl Environment {
     pub(crate) fn from_process() -> Self {
         Self {
             server_addr: env::var_os(ENV_SERVER_ADDR),
+            agent_address: env::var_os(ENV_AGENT_ADDRESS),
             bind_addr: env::var_os(ENV_BIND_ADDR),
             heartbeat_interval_secs: env::var_os(ENV_HEARTBEAT_INTERVAL_SECS),
             poll_interval_secs: env::var_os(ENV_POLL_INTERVAL_SECS),
@@ -87,6 +92,7 @@ pub(crate) struct ServerConfig {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct AgentConfig {
     pub(crate) server_addr: SocketAddr,
+    pub(crate) agent_address: String,
     pub(crate) heartbeat_interval: Duration,
     pub(crate) poll_interval: Duration,
     pub(crate) working_dir: PathBuf,
@@ -188,6 +194,7 @@ pub(crate) fn server(
 
 pub(crate) fn agent(
     cli_server_addr: Option<SocketAddr>,
+    cli_agent_address: Option<String>,
     cli_heartbeat_interval_secs: Option<u64>,
     cli_poll_interval_secs: Option<u64>,
     cli_working_dir: Option<PathBuf>,
@@ -199,6 +206,23 @@ pub(crate) fn agent(
         DEFAULT_SERVER_ADDR,
         ENV_SERVER_ADDR,
     )?;
+    let agent_address = match cli_agent_address {
+        Some(address) => address,
+        None => match environment.agent_address.as_deref() {
+            Some(value) => value
+                .to_str()
+                .ok_or(ConfigError::InvalidValue {
+                    setting: "agent address",
+                })?
+                .to_owned(),
+            None => format!("agent-process-{}", std::process::id()),
+        },
+    };
+    if agent_address.trim().is_empty() {
+        return Err(ConfigError::InvalidValue {
+            setting: "agent address",
+        });
+    }
     let heartbeat_interval_secs = resolve_value(
         cli_heartbeat_interval_secs,
         environment.heartbeat_interval_secs.as_deref(),
@@ -217,6 +241,7 @@ pub(crate) fn agent(
 
     Ok(AgentConfig {
         server_addr,
+        agent_address,
         heartbeat_interval: positive_duration(
             heartbeat_interval_secs,
             ENV_HEARTBEAT_INTERVAL_SECS,
@@ -318,7 +343,8 @@ mod tests {
         let server_config =
             server(None, None, None, None, &environment).expect("defaults are valid");
         let client_config = client(None, &environment).expect("defaults are valid");
-        let agent_config = agent(None, None, None, None, &environment).expect("defaults are valid");
+        let agent_config =
+            agent(None, None, None, None, None, &environment).expect("defaults are valid");
 
         assert_eq!(server_config.bind_addr, DEFAULT_BIND_ADDR);
         assert_eq!(
@@ -355,6 +381,101 @@ mod tests {
     }
 
     #[test]
+    fn agent_config_uses_process_scoped_default_address() {
+        let environment = Environment::default();
+        let agent_config = agent(None, None, None, None, None, &environment)
+            .expect("default agent configuration is valid");
+
+        assert_eq!(
+            agent_config.agent_address,
+            format!("agent-process-{}", std::process::id())
+        );
+    }
+
+    #[test]
+    fn agent_address_environment_value_is_used_and_cli_overrides_it() {
+        let environment = Environment {
+            agent_address: Some(OsString::from("environment-agent")),
+            ..Environment::default()
+        };
+
+        let environment_config = agent(None, None, None, None, None, &environment)
+            .expect("environment agent address is valid");
+        let cli_config = agent(
+            None,
+            Some("cli-agent".to_owned()),
+            None,
+            None,
+            None,
+            &environment,
+        )
+        .expect("CLI agent address overrides the environment");
+
+        assert_eq!(environment_config.agent_address, "environment-agent");
+        assert_eq!(cli_config.agent_address, "cli-agent");
+
+        let invalid_environment = Environment {
+            agent_address: Some(OsString::from(" \t\n")),
+            ..Environment::default()
+        };
+        let cli_config = agent(
+            None,
+            Some("cli-agent".to_owned()),
+            None,
+            None,
+            None,
+            &invalid_environment,
+        )
+        .expect("CLI agent address overrides an invalid environment value");
+        assert_eq!(cli_config.agent_address, "cli-agent");
+    }
+
+    #[test]
+    fn blank_agent_address_is_rejected_without_echoing_value() {
+        let environment = Environment::default();
+        for address in ["", " \t\n"] {
+            let error = agent(
+                None,
+                Some(address.to_owned()),
+                None,
+                None,
+                None,
+                &environment,
+            )
+            .expect_err("blank or whitespace-only address is invalid");
+
+            assert!(error.to_string().contains("agent address"));
+            assert!(!error.to_string().contains('\n'));
+        }
+
+        let environment = Environment {
+            agent_address: Some(OsString::from(" \t\n")),
+            ..Environment::default()
+        };
+        let error = agent(None, None, None, None, None, &environment)
+            .expect_err("whitespace-only environment address is invalid");
+
+        assert!(error.to_string().contains("agent address"));
+        assert!(!error.to_string().contains('\n'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_agent_address_environment_value_is_rejected_safely() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let environment = Environment {
+            agent_address: Some(OsString::from_vec(vec![0xff, 0xfe])),
+            ..Environment::default()
+        };
+        let error = agent(None, None, None, None, None, &environment)
+            .expect_err("non-UTF-8 agent address is invalid");
+
+        assert!(error.to_string().contains("agent address"));
+        assert!(!error.to_string().contains('\u{fffd}'));
+    }
+
+    #[test]
     fn environment_overrides_defaults_and_cli_overrides_environment() {
         let environment = Environment {
             server_addr: Some(OsString::from("127.0.0.1:9000")),
@@ -374,8 +495,8 @@ mod tests {
             server(None, None, None, None, &environment).expect("environment values are valid");
         let cli_server_config = server(None, None, Some(11), Some(3), &environment)
             .expect("CLI values should override the environment");
-        let agent_config =
-            agent(None, None, None, None, &environment).expect("environment values are valid");
+        let agent_config = agent(None, None, None, None, None, &environment)
+            .expect("environment values are valid");
 
         assert_eq!(env_client.server_addr, address(9000));
         assert_eq!(cli_client.server_addr, address(9002));
@@ -439,11 +560,11 @@ mod tests {
             Err(ConfigError::ZeroDuration { .. })
         ));
         assert!(matches!(
-            agent(None, Some(0), None, None, &environment),
+            agent(None, None, Some(0), None, None, &environment),
             Err(ConfigError::ZeroDuration { .. })
         ));
         assert!(matches!(
-            agent(None, None, Some(0), None, &environment),
+            agent(None, None, None, Some(0), None, &environment),
             Err(ConfigError::ZeroDuration { .. })
         ));
 
@@ -452,7 +573,7 @@ mod tests {
             ..Environment::default()
         };
         assert!(matches!(
-            agent(None, None, None, None, &environment),
+            agent(None, None, None, None, None, &environment),
             Err(ConfigError::ZeroDuration { .. })
         ));
 
@@ -477,7 +598,7 @@ mod tests {
     fn agent_config_contains_the_resolved_working_directory() {
         let environment = Environment::default();
         let path = std::env::temp_dir();
-        let config: AgentConfig = agent(None, None, None, Some(path.clone()), &environment)
+        let config: AgentConfig = agent(None, None, None, None, Some(path.clone()), &environment)
             .expect("system temporary directory should be valid");
 
         assert_eq!(
@@ -494,7 +615,7 @@ mod tests {
             ..Environment::default()
         };
 
-        let config = agent(None, None, None, None, &environment)
+        let config = agent(None, None, None, None, None, &environment)
             .expect("environment working directory should be valid");
 
         assert_eq!(
@@ -511,7 +632,7 @@ mod tests {
             ..Environment::default()
         };
 
-        let config = agent(None, None, None, Some(expected.clone()), &environment)
+        let config = agent(None, None, None, None, Some(expected.clone()), &environment)
             .expect("CLI working directory should override the environment");
 
         assert_eq!(
