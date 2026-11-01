@@ -3,6 +3,9 @@ use crate::{domain::TransitionError, error::AppError, state::error::StateStoreEr
 pub(crate) fn map_store_error(error: StateStoreError) -> AppError {
     match error {
         StateStoreError::NotFound { resource, id } => AppError::not_found(resource, id),
+        StateStoreError::Transition(TransitionError::AllocationMissing {
+            allocation_id: Some(id),
+        }) => AppError::not_found("allocation", id.to_string()),
         StateStoreError::Transition(error @ TransitionError::InconsistentState { .. }) => {
             AppError::internal("state transition encountered inconsistent state", error)
         }

@@ -1,7 +1,8 @@
 use super::map_store_error;
 use crate::{
     domain::{
-        Agent, AgentId, AgentSnapshot, AllocationId, AllocationSnapshot, JobSnapshot, Timestamp,
+        Agent, AgentId, AgentSnapshot, AllocationId, AllocationSnapshot, ApplyOutcome, JobEvent,
+        JobId, JobSnapshot, Timestamp,
     },
     error::AppError,
     state::store::{AssignmentStartOutcome, StateStore},
@@ -84,9 +85,11 @@ impl AgentsService {
 
     pub(crate) fn acknowledge_start(
         &self,
+        job_id: JobId,
         agent_id: AgentId,
         allocation_id: AllocationId,
         now: Timestamp,
+        occurred_at: Timestamp,
         timeout: Duration,
     ) -> Result<AssignmentStartOutcome, AppError> {
         if timeout.is_zero() {
@@ -96,7 +99,24 @@ impl AgentsService {
         }
 
         self.store
-            .acknowledge_start(agent_id, allocation_id, now, timeout)
+            .acknowledge_start(job_id, agent_id, allocation_id, now, occurred_at, timeout)
+            .map_err(map_store_error)
+    }
+
+    pub(crate) fn report_allocation_event(
+        &self,
+        event: JobEvent,
+        now: Timestamp,
+        timeout: Duration,
+    ) -> Result<ApplyOutcome, AppError> {
+        if timeout.is_zero() {
+            return Err(AppError::invalid_input(
+                "assignment timeout must be greater than zero",
+            ));
+        }
+
+        self.store
+            .append_agent_event(&event, now, timeout)
             .map_err(map_store_error)
     }
 
@@ -485,7 +505,7 @@ mod tests {
             .poll_assignment(agent_id, now, Duration::ZERO)
             .unwrap_err();
         let start_error = service
-            .acknowledge_start(agent_id, allocation_id, now, Duration::ZERO)
+            .acknowledge_start(job_id, agent_id, allocation_id, now, now, Duration::ZERO)
             .unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
@@ -518,7 +538,14 @@ mod tests {
             .unwrap();
 
         let wrong_agent = service
-            .acknowledge_start(agent_id(25), allocation_id, timestamp, timeout)
+            .acknowledge_start(
+                job_id,
+                agent_id(25),
+                allocation_id,
+                timestamp,
+                timestamp,
+                timeout,
+            )
             .unwrap_err();
         assert_eq!(wrong_agent.kind(), ErrorKind::Conflict);
         assert_eq!(
@@ -527,10 +554,24 @@ mod tests {
         );
 
         let first = service
-            .acknowledge_start(assigned_agent_id, allocation_id, timestamp, timeout)
+            .acknowledge_start(
+                job_id,
+                assigned_agent_id,
+                allocation_id,
+                timestamp,
+                timestamp,
+                timeout,
+            )
             .unwrap();
         let retry = service
-            .acknowledge_start(assigned_agent_id, allocation_id, timestamp, timeout)
+            .acknowledge_start(
+                job_id,
+                assigned_agent_id,
+                allocation_id,
+                timestamp,
+                timestamp,
+                timeout,
+            )
             .unwrap();
 
         assert_eq!(first, super::AssignmentStartOutcome::Started);
@@ -560,8 +601,10 @@ mod tests {
 
         let outcome = service
             .acknowledge_start(
+                job_id,
                 agent_id,
                 allocation_id,
+                Timestamp::from_unix_millis(1_200),
                 Timestamp::from_unix_millis(1_200),
                 Duration::from_millis(1_000),
             )
@@ -622,8 +665,10 @@ mod tests {
 
         let error = service
             .acknowledge_start(
+                old_job_id,
                 agent_id,
                 old_allocation_id,
+                Timestamp::from_unix_millis(250),
                 Timestamp::from_unix_millis(250),
                 Duration::from_millis(1_000),
             )

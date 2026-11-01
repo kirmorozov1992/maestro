@@ -566,9 +566,11 @@ impl StateStore {
 
     pub(crate) fn acknowledge_start(
         &self,
+        job_id: JobId,
         agent_id: AgentId,
         allocation_id: AllocationId,
         now: Timestamp,
+        occurred_at: Timestamp,
         timeout: Duration,
     ) -> Result<AssignmentStartOutcome, StateStoreError> {
         let mut state = self.lock()?;
@@ -580,6 +582,13 @@ impl StateStore {
             .get(&allocation_id)
             .cloned()
             .ok_or_else(|| StateStoreError::not_found("allocation", allocation_id))?;
+        if allocation.job_id() != job_id {
+            return Err(StateStoreError::conflict(
+                "allocation",
+                allocation_id,
+                "start acknowledgement referenced a different job",
+            ));
+        }
         if allocation.agent_id() != agent_id {
             return Err(StateStoreError::conflict(
                 "allocation",
@@ -637,10 +646,10 @@ impl StateStore {
         let outcome = apply_events_in_state(
             &mut state,
             &[JobEvent::Started {
-                job_id: allocation.job_id(),
+                job_id,
                 allocation_id,
                 agent_id,
-                occurred_at: now,
+                occurred_at,
             }],
         )?;
         if outcome != ApplyOutcome::Applied {
@@ -782,6 +791,34 @@ impl StateStore {
 
     pub(crate) fn append_event(&self, event: &JobEvent) -> Result<ApplyOutcome, StateStoreError> {
         let mut state = self.lock()?;
+        apply_events_in_state(&mut state, std::slice::from_ref(event))
+    }
+
+    pub(crate) fn append_agent_event(
+        &self,
+        event: &JobEvent,
+        now: Timestamp,
+        timeout: Duration,
+    ) -> Result<ApplyOutcome, StateStoreError> {
+        let mut state = self.lock()?;
+        let allocation_id = event_allocation_id(event).ok_or(StateStoreError::invariant(
+            "agent event must reference an allocation",
+        ))?;
+        let allocation = state
+            .allocations
+            .get(&allocation_id)
+            .cloned()
+            .ok_or_else(|| StateStoreError::not_found("allocation", allocation_id))?;
+        if allocation.status() == AllocationStatus::Assigned
+            && assignment_expired(now, allocation.assigned_at(), timeout)
+        {
+            expire_assignment(&mut state, &allocation, now)?;
+            return Err(StateStoreError::conflict(
+                "allocation",
+                allocation_id,
+                "unstarted assignment expired before the agent event",
+            ));
+        }
         apply_events_in_state(&mut state, std::slice::from_ref(event))
     }
 

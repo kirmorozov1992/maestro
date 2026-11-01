@@ -1,13 +1,14 @@
 use crate::{
     application::{AgentsService, JobDetails, JobsService, StopOutcome},
     config::ServerConfig,
-    domain::Timestamp,
+    domain::{AgentId, AllocationId, ApplyOutcome, JobEvent, Timestamp},
     error::{AppError, ErrorKind},
     scheduler::{Scheduler, SchedulerError},
     scheduler_loop::{SchedulerLoop, SchedulerLoopError},
-    state::store::StateStore,
+    state::store::{AssignmentStartOutcome, StateStore},
     transport::v1::{
-        CreateJobRequest, ErrorResponse, HealthResponse, JobListResponse, JobResponse,
+        AgentResponse, AllocationEventRequest, AssignmentResponse, CreateJobRequest, ErrorResponse,
+        EventReportResponse, HealthResponse, JobListResponse, JobResponse, RegisterAgentRequest,
         StopJobResponse,
     },
 };
@@ -69,10 +70,6 @@ impl Error for ServerError {
     }
 }
 
-#[expect(
-    dead_code,
-    reason = "M5.4 agent handlers will use the remaining shared application service"
-)]
 struct ServerState {
     jobs: JobsService,
     agents: AgentsService,
@@ -152,6 +149,16 @@ fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/jobs", get(list_jobs).post(create_job))
         .route("/v1/jobs/{job_id}", get(get_job))
         .route("/v1/jobs/{job_id}/stop", post(stop_job))
+        .route("/v1/agents/register", post(register_agent))
+        .route("/v1/agents/{agent_id}/heartbeat", post(heartbeat_agent))
+        .route(
+            "/v1/agents/{agent_id}/assignments/next",
+            get(next_assignment),
+        )
+        .route(
+            "/v1/allocations/{allocation_id}/events",
+            post(report_allocation_event),
+        )
         .with_state(state)
 }
 
@@ -240,12 +247,158 @@ async fn stop_job(
     }
 }
 
+async fn register_agent(
+    State(state): State<Arc<ServerState>>,
+    request: Result<Json<RegisterAgentRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => return json_rejection_response(rejection),
+    };
+    let registered_at = match current_timestamp() {
+        Ok(timestamp) => timestamp,
+        Err(reason) => return clock_error_response(reason),
+    };
+    match state
+        .agents
+        .register_agent(AgentId::new(), request.address, registered_at)
+    {
+        Ok(agent) => (StatusCode::CREATED, Json(AgentResponse::from(&agent))).into_response(),
+        Err(error) => app_error_response(error),
+    }
+}
+
+async fn heartbeat_agent(
+    State(state): State<Arc<ServerState>>,
+    path: Result<Path<String>, PathRejection>,
+) -> Response {
+    let Path(id) = match path {
+        Ok(path) => path,
+        Err(_) => return invalid_agent_id_response(),
+    };
+    let id = match id.parse::<AgentId>() {
+        Ok(id) => id,
+        Err(_) => return invalid_agent_id_response(),
+    };
+    let timestamp = match current_timestamp() {
+        Ok(timestamp) => timestamp,
+        Err(reason) => return clock_error_response(reason),
+    };
+    match state.agents.heartbeat(id, timestamp) {
+        Ok(agent) => (StatusCode::OK, Json(AgentResponse::from(&agent))).into_response(),
+        Err(error) => app_error_response(error),
+    }
+}
+
+async fn next_assignment(
+    State(state): State<Arc<ServerState>>,
+    path: Result<Path<String>, PathRejection>,
+) -> Response {
+    let Path(id) = match path {
+        Ok(path) => path,
+        Err(_) => return invalid_agent_id_response(),
+    };
+    let id = match id.parse::<AgentId>() {
+        Ok(id) => id,
+        Err(_) => return invalid_agent_id_response(),
+    };
+    let now = match current_timestamp() {
+        Ok(timestamp) => timestamp,
+        Err(reason) => return clock_error_response(reason),
+    };
+    match state
+        .agents
+        .poll_assignment(id, now, state.assignment_timeout)
+    {
+        Ok(Some(assignment)) => {
+            (StatusCode::OK, Json(AssignmentResponse::from(&assignment))).into_response()
+        }
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => app_error_response(error),
+    }
+}
+
+async fn report_allocation_event(
+    State(state): State<Arc<ServerState>>,
+    path: Result<Path<String>, PathRejection>,
+    request: Result<Json<AllocationEventRequest>, JsonRejection>,
+) -> Response {
+    let Path(id) = match path {
+        Ok(path) => path,
+        Err(_) => return invalid_allocation_id_response(),
+    };
+    let id = match id.parse::<AllocationId>() {
+        Ok(id) => id,
+        Err(_) => return invalid_allocation_id_response(),
+    };
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => return json_rejection_response(rejection),
+    };
+    let event: JobEvent = request.into_domain_event(id);
+    match event {
+        JobEvent::Started {
+            job_id,
+            allocation_id,
+            agent_id,
+            occurred_at,
+        } => {
+            let now = match current_timestamp() {
+                Ok(timestamp) => timestamp,
+                Err(reason) => return clock_error_response(reason),
+            };
+            match state.agents.acknowledge_start(
+                job_id,
+                agent_id,
+                allocation_id,
+                now,
+                occurred_at,
+                state.assignment_timeout,
+            ) {
+                Ok(AssignmentStartOutcome::Started) => event_report_response(ApplyOutcome::Applied),
+                Ok(AssignmentStartOutcome::Duplicate) => {
+                    event_report_response(ApplyOutcome::Duplicate)
+                }
+                Ok(AssignmentStartOutcome::Expired) => {
+                    app_error_response(AppError::conflict("assignment expired"))
+                }
+                Err(error) => app_error_response(error),
+            }
+        }
+        event => {
+            let now = match current_timestamp() {
+                Ok(timestamp) => timestamp,
+                Err(reason) => return clock_error_response(reason),
+            };
+            match state
+                .agents
+                .report_allocation_event(event, now, state.assignment_timeout)
+            {
+                Ok(outcome) => event_report_response(outcome),
+                Err(error) => app_error_response(error),
+            }
+        }
+    }
+}
+
+fn event_report_response(outcome: ApplyOutcome) -> Response {
+    (StatusCode::OK, Json(EventReportResponse::from(outcome))).into_response()
+}
+
 fn job_response(details: &JobDetails) -> JobResponse {
     JobResponse::from_parts(&details.job, details.allocation.as_ref())
 }
 
 fn invalid_job_id_response() -> Response {
     app_error_response(AppError::invalid_input("job ID path is invalid"))
+}
+
+fn invalid_agent_id_response() -> Response {
+    app_error_response(AppError::invalid_input("agent ID path is invalid"))
+}
+
+fn invalid_allocation_id_response() -> Response {
+    app_error_response(AppError::invalid_input("allocation ID path is invalid"))
 }
 
 fn json_rejection_response(rejection: JsonRejection) -> Response {
@@ -370,6 +523,7 @@ mod tests {
     };
     use serde_json::{Value, json};
     use std::{
+        collections::BTreeMap,
         io::{Read, Write},
         net::SocketAddr,
         num::NonZeroU32,
@@ -424,8 +578,53 @@ mod tests {
         (store, job_id)
     }
 
+    fn agent_assignment_store() -> (StateStore, JobId, AgentId, AllocationId) {
+        let store = StateStore::default();
+        let job_id = JobId::new();
+        let agent_id = AgentId::new();
+        let allocation_id = AllocationId::new();
+        let assigned_at = Timestamp::from_unix_millis(1_000);
+        let env = BTreeMap::from([("TOKEN".to_owned(), "must-not-leak".to_owned())]);
+        store
+            .create_job(Job::new(
+                job_id,
+                JobSpec::new("echo", Vec::new(), Some(env), None)
+                    .expect("fixture job spec is valid"),
+                assigned_at,
+            ))
+            .expect("fixture job should be stored");
+        store
+            .register_agent(Agent::new(
+                agent_id,
+                "worker.example:9000".into(),
+                assigned_at,
+            ))
+            .expect("fixture agent should be stored");
+        store
+            .assign_allocation(Allocation::new(
+                allocation_id,
+                job_id,
+                agent_id,
+                NonZeroU32::MIN,
+                assigned_at,
+            ))
+            .expect("fixture allocation should be stored");
+        (store, job_id, agent_id, allocation_id)
+    }
+
     async fn start_test_router(
         store: StateStore,
+    ) -> (
+        SocketAddr,
+        oneshot::Sender<()>,
+        JoinHandle<Result<(), std::io::Error>>,
+    ) {
+        start_test_router_with_timeout(store, Duration::from_secs(30)).await
+    }
+
+    async fn start_test_router_with_timeout(
+        store: StateStore,
+        assignment_timeout: Duration,
     ) -> (
         SocketAddr,
         oneshot::Sender<()>,
@@ -439,7 +638,7 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
-                super::router(super::server_state(store, Duration::from_secs(30))),
+                super::router(super::server_state(store, assignment_timeout)),
             )
             .with_graceful_shutdown(async move {
                 let _ = shutdown_receiver.await;
@@ -489,6 +688,13 @@ mod tests {
             .split_once("\r\n\r\n")
             .expect("response should contain headers and body");
         serde_json::from_str(body).expect("response should contain JSON")
+    }
+
+    fn response_body(response: &str) -> &str {
+        response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("response should contain headers and a body")
     }
 
     #[tokio::test]
@@ -673,6 +879,227 @@ mod tests {
             store_snapshot.get_job(assigned_job_id).unwrap().status(),
             JobStatus::Assigned
         );
+
+        shutdown_sender
+            .send(())
+            .expect("test server should still be running");
+        server
+            .await
+            .expect("test server task should finish")
+            .expect("test router should stop cleanly");
+    }
+
+    #[tokio::test]
+    async fn agent_registration_heartbeat_and_empty_poll_routes_work() {
+        let (address, shutdown_sender, server) = start_test_router(StateStore::default()).await;
+        let registered = http_request(
+            address,
+            "POST",
+            "/v1/agents/register",
+            r#"{"address":"worker.example:9000"}"#,
+        )
+        .await;
+
+        assert_eq!(response_status(&registered), 201);
+        let registered_agent = response_json(&registered);
+        let agent_id = registered_agent["id"]
+            .as_str()
+            .expect("registration response should include agent ID");
+        assert_eq!(registered_agent["address"], "worker.example:9000");
+        assert_eq!(registered_agent["health"], "healthy");
+        assert_eq!(registered_agent["availability"], "idle");
+
+        let heartbeat_path = format!("/v1/agents/{agent_id}/heartbeat");
+        let heartbeat = http_request(address, "POST", &heartbeat_path, "").await;
+        assert_eq!(response_status(&heartbeat), 200);
+        assert_eq!(response_json(&heartbeat)["id"], agent_id);
+        let repeated_heartbeat = http_request(address, "POST", &heartbeat_path, "").await;
+        assert_eq!(response_status(&repeated_heartbeat), 200);
+        assert!(
+            response_json(&repeated_heartbeat)["last_heartbeat_at"]
+                .as_u64()
+                .expect("heartbeat response should contain a timestamp")
+                >= response_json(&heartbeat)["last_heartbeat_at"]
+                    .as_u64()
+                    .expect("heartbeat response should contain a timestamp")
+        );
+
+        let empty_poll_path = format!("/v1/agents/{agent_id}/assignments/next");
+        let empty_poll = http_request(address, "GET", &empty_poll_path, "").await;
+        assert_eq!(response_status(&empty_poll), 204);
+        assert!(response_body(&empty_poll).is_empty());
+
+        let malformed = http_request(address, "POST", "/v1/agents/not-a-uuid/heartbeat", "").await;
+        assert_eq!(response_status(&malformed), 400);
+        assert_eq!(response_json(&malformed)["code"], "invalid_input");
+
+        shutdown_sender
+            .send(())
+            .expect("test server should still be running");
+        server
+            .await
+            .expect("test server task should finish")
+            .expect("test router should stop cleanly");
+    }
+
+    #[tokio::test]
+    async fn assignment_poll_is_sticky_and_hides_environment_values() {
+        let (store, job_id, agent_id, allocation_id) = agent_assignment_store();
+        let (address, shutdown_sender, server) =
+            start_test_router_with_timeout(store, Duration::from_millis(u64::MAX)).await;
+        let path = format!("/v1/agents/{agent_id}/assignments/next");
+
+        let first = http_request(address, "GET", &path, "").await;
+        assert_eq!(response_status(&first), 200);
+        let first_json = response_json(&first);
+        assert_eq!(first_json["job"]["id"], job_id.to_string());
+        assert_eq!(first_json["allocation"]["id"], allocation_id.to_string());
+        assert_eq!(first_json["job"]["spec"]["env_keys"], json!(["TOKEN"]));
+        assert!(!first.contains("must-not-leak"));
+
+        let repeated = http_request(address, "GET", &path, "").await;
+        assert_eq!(response_status(&repeated), 200);
+        assert_eq!(
+            response_json(&repeated)["allocation"]["id"],
+            allocation_id.to_string()
+        );
+
+        shutdown_sender
+            .send(())
+            .expect("test server should still be running");
+        server
+            .await
+            .expect("test server task should finish")
+            .expect("test router should stop cleanly");
+    }
+
+    #[tokio::test]
+    async fn allocation_events_check_ownership_staleness_and_terminal_duplicates() {
+        let (store, job_id, agent_id, allocation_id) = agent_assignment_store();
+        let (address, shutdown_sender, server) =
+            start_test_router_with_timeout(store.clone(), Duration::from_millis(u64::MAX)).await;
+        let path = format!("/v1/allocations/{allocation_id}/events");
+        let foreign_agent_id = AgentId::new();
+        store
+            .register_agent(Agent::new(
+                foreign_agent_id,
+                "foreign-worker.example:9000".into(),
+                Timestamp::from_unix_millis(1_000),
+            ))
+            .expect("foreign agent fixture should be stored");
+        let unknown_allocation_id = AllocationId::new();
+        let unknown_path = format!("/v1/allocations/{unknown_allocation_id}/events");
+
+        let unknown_allocation = http_request(
+            address,
+            "POST",
+            &unknown_path,
+            &format!(
+                r#"{{"type":"started","job_id":"{job_id}","agent_id":"{agent_id}","occurred_at":2000}}"#
+            ),
+        )
+        .await;
+        assert_eq!(response_status(&unknown_allocation), 404);
+        assert_eq!(response_json(&unknown_allocation)["code"], "not_found");
+
+        let foreign_start = http_request(
+            address,
+            "POST",
+            &path,
+            &format!(
+                r#"{{"type":"started","job_id":"{job_id}","agent_id":"{foreign_agent_id}","occurred_at":2000}}"#
+            ),
+        )
+        .await;
+        assert_eq!(response_status(&foreign_start), 409);
+        assert_eq!(response_json(&foreign_start)["code"], "conflict");
+
+        let started_body = format!(
+            r#"{{"type":"started","job_id":"{job_id}","agent_id":"{agent_id}","occurred_at":2000}}"#
+        );
+        let started = http_request(address, "POST", &path, &started_body).await;
+        assert_eq!(response_status(&started), 200);
+        assert_eq!(response_json(&started)["outcome"], "applied");
+
+        let repeated_start = http_request(address, "POST", &path, &started_body).await;
+        assert_eq!(response_status(&repeated_start), 200);
+        assert_eq!(response_json(&repeated_start)["outcome"], "duplicate");
+
+        let stale_finish = http_request(
+            address,
+            "POST",
+            &path,
+            &format!(
+                r#"{{"type":"finished","job_id":"{job_id}","agent_id":"{agent_id}","occurred_at":1500,"result":{{"type":"exited","exit_code":0}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(response_status(&stale_finish), 409);
+
+        let finished_body = format!(
+            r#"{{"type":"finished","job_id":"{job_id}","agent_id":"{agent_id}","occurred_at":3000,"result":{{"type":"exited","exit_code":0}}}}"#
+        );
+        let finished = http_request(address, "POST", &path, &finished_body).await;
+        assert_eq!(response_status(&finished), 200);
+        assert_eq!(response_json(&finished)["outcome"], "applied");
+
+        let duplicate = http_request(address, "POST", &path, &finished_body).await;
+        assert_eq!(response_status(&duplicate), 200);
+        assert_eq!(response_json(&duplicate)["outcome"], "duplicate");
+
+        assert_eq!(
+            store.get_job(job_id).unwrap().status(),
+            JobStatus::Succeeded
+        );
+        shutdown_sender
+            .send(())
+            .expect("test server should still be running");
+        server
+            .await
+            .expect("test server task should finish")
+            .expect("test router should stop cleanly");
+    }
+
+    #[tokio::test]
+    async fn start_event_cannot_bypass_assignment_deadline() {
+        let (store, job_id, agent_id, allocation_id) = agent_assignment_store();
+        let (address, shutdown_sender, server) =
+            start_test_router_with_timeout(store.clone(), Duration::from_millis(1)).await;
+        let path = format!("/v1/allocations/{allocation_id}/events");
+        let body = format!(
+            r#"{{"type":"started","job_id":"{job_id}","agent_id":"{agent_id}","occurred_at":2000}}"#
+        );
+
+        let response = http_request(address, "POST", &path, &body).await;
+
+        assert_eq!(response_status(&response), 409);
+        assert_eq!(response_json(&response)["code"], "conflict");
+        assert_eq!(store.get_job(job_id).unwrap().status(), JobStatus::Lost);
+
+        shutdown_sender
+            .send(())
+            .expect("test server should still be running");
+        server
+            .await
+            .expect("test server task should finish")
+            .expect("test router should stop cleanly");
+    }
+
+    #[tokio::test]
+    async fn terminal_event_cannot_bypass_unstarted_assignment_deadline() {
+        let (store, job_id, agent_id, allocation_id) = agent_assignment_store();
+        let (address, shutdown_sender, server) =
+            start_test_router_with_timeout(store.clone(), Duration::from_millis(1)).await;
+        let path = format!("/v1/allocations/{allocation_id}/events");
+        let body = format!(
+            r#"{{"type":"finished","job_id":"{job_id}","agent_id":"{agent_id}","occurred_at":2000,"result":{{"type":"spawn_failed"}}}}"#
+        );
+
+        let response = http_request(address, "POST", &path, &body).await;
+
+        assert_eq!(response_status(&response), 409);
+        assert_eq!(response_json(&response)["code"], "conflict");
+        assert_eq!(store.get_job(job_id).unwrap().status(), JobStatus::Lost);
 
         shutdown_sender
             .send(())
