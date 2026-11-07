@@ -184,12 +184,14 @@ impl<'de> Deserialize<'de> for JobEvent {
 pub enum ProcessResult {
     Exited { exit_code: i32 },
     SpawnFailed,
+    ExecutionFailed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
     UserRequested,
+    AgentShutdown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

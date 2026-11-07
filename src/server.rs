@@ -313,9 +313,11 @@ async fn next_assignment(
         .agents
         .poll_assignment(id, now, state.assignment_timeout)
     {
-        Ok(Some(assignment)) => {
-            (StatusCode::OK, Json(AssignmentResponse::from(&assignment))).into_response()
-        }
+        Ok(Some(assignment)) => (
+            StatusCode::OK,
+            Json(AssignmentResponse::new(&assignment, now)),
+        )
+            .into_response(),
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => app_error_response(error),
     }
@@ -1037,7 +1039,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn assignment_poll_is_sticky_and_hides_environment_values() {
+    async fn assignment_poll_is_sticky_and_delivers_env_only_in_execution_payload() {
         let (store, job_id, agent_id, allocation_id) = agent_assignment_store();
         let (address, shutdown_sender, server) =
             start_test_router_with_timeout(store, Duration::from_millis(u64::MAX)).await;
@@ -1049,7 +1051,9 @@ mod tests {
         assert_eq!(first_json["job"]["id"], job_id.to_string());
         assert_eq!(first_json["allocation"]["id"], allocation_id.to_string());
         assert_eq!(first_json["job"]["spec"]["env_keys"], json!(["TOKEN"]));
-        assert!(!first.contains("must-not-leak"));
+        assert_eq!(first_json["execution"]["env"]["TOKEN"], "must-not-leak");
+        assert!(first_json["job"]["spec"].get("env").is_none());
+        assert!(first_json["server_time"].as_u64().unwrap() >= 1_000);
 
         let repeated = http_request(address, "GET", &path, "").await;
         assert_eq!(response_status(&repeated), 200);
@@ -1218,5 +1222,162 @@ mod tests {
         tick().expect("scheduler tick should succeed");
 
         assert_eq!(store.get_job(job_id).unwrap().status(), JobStatus::Lost);
+    }
+    #[tokio::test]
+    async fn lifecycle_reporting_runs_real_assignment_through_server_and_agent() {
+        use crate::{
+            config::AgentConfig,
+            domain::{AgentAvailability, TerminalResult},
+        };
+        for code in [Some(0), Some(7), None] {
+            let store = StateStore::default();
+            let (address, server_stop, server) =
+                start_test_router_with_timeout(store.clone(), Duration::from_secs(10)).await;
+            let (agent_stop, agent_shutdown) = oneshot::channel();
+            let agent = tokio::spawn(crate::worker::agent::run_with_shutdown(
+                AgentConfig {
+                    server_addr: address,
+                    agent_address: format!("m67-{code:?}"),
+                    heartbeat_interval: Duration::from_millis(10),
+                    poll_interval: Duration::from_millis(5),
+                    working_dir: std::env::temp_dir(),
+                },
+                async {
+                    let _ = agent_shutdown.await;
+                },
+            ));
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while store.list_agents().unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let command = if code.is_some() {
+                std::env::current_exe().unwrap()
+            } else {
+                std::env::temp_dir().join(format!("missing-{}", JobId::new()))
+            };
+            let request = json!({"command":command,"args":["--exact","worker::lifecycle::tests::process_fixture","--ignored","--nocapture"],"env":{"MAESTRO_M67_MODE":"exit","MAESTRO_M67_CODE":code.unwrap_or(0).to_string()}});
+            let client = reqwest::Client::new();
+            let response = client
+                .post(format!("http://{address}/v1/jobs"))
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+            let response: Value = response.json().await.unwrap();
+            assert!(response["spec"].get("env").is_none());
+            let job_id: JobId = response["id"].as_str().unwrap().parse().unwrap();
+            Scheduler::new(store.clone())
+                .tick(super::current_timestamp().unwrap(), Duration::from_secs(10))
+                .unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let job = store.get_job(job_id).unwrap();
+                    if job.finished_at().is_some() {
+                        break job;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            let _ = agent_stop.send(());
+            let agent_result = tokio::time::timeout(Duration::from_secs(3), agent)
+                .await
+                .unwrap()
+                .unwrap();
+            server_stop.send(()).unwrap();
+            server.await.unwrap().unwrap();
+            agent_result.unwrap();
+            let job = result.unwrap();
+            assert_eq!(
+                job.status(),
+                if code == Some(0) {
+                    JobStatus::Succeeded
+                } else {
+                    JobStatus::Failed
+                }
+            );
+            assert_eq!(
+                job.terminal_result(),
+                Some(match code {
+                    Some(exit_code) => TerminalResult::Exited { exit_code },
+                    None => TerminalResult::SpawnFailed,
+                })
+            );
+            assert_eq!(job.started_at().is_some(), code.is_some());
+            assert_eq!(
+                store.list_agents().unwrap()[0].availability(),
+                AgentAvailability::Idle
+            );
+        }
+    }
+    #[tokio::test]
+    async fn lifecycle_reporting_shutdown_reaps_active_assignment_and_reports_stop() {
+        use crate::{config::AgentConfig, domain::AgentAvailability};
+        let store = StateStore::default();
+        let (address, server_stop, server) =
+            start_test_router_with_timeout(store.clone(), Duration::from_secs(10)).await;
+        let directory = std::env::temp_dir().join(format!("maestro-m67-runtime-{}", JobId::new()));
+        std::fs::create_dir(&directory).unwrap();
+        let (agent_stop, agent_shutdown) = oneshot::channel();
+        let agent = tokio::spawn(crate::worker::agent::run_with_shutdown(
+            AgentConfig {
+                server_addr: address,
+                agent_address: "m67-shutdown".into(),
+                heartbeat_interval: Duration::from_millis(10),
+                poll_interval: Duration::from_millis(5),
+                working_dir: directory.clone(),
+            },
+            async {
+                let _ = agent_shutdown.await;
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while store.list_agents().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let request = json!({"command":std::env::current_exe().unwrap(),"args":["--exact","worker::lifecycle::tests::process_fixture","--ignored","--nocapture"],"env":{"MAESTRO_M67_MODE":"wait","MAESTRO_M67_CODE":"0","MAESTRO_M67_READY":directory.join("ready"),"MAESTRO_M67_RELEASE":directory.join("release")}});
+        let response: Value = reqwest::Client::new()
+            .post(format!("http://{address}/v1/jobs"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let job_id: JobId = response["id"].as_str().unwrap().parse().unwrap();
+        Scheduler::new(store.clone())
+            .tick(super::current_timestamp().unwrap(), Duration::from_secs(10))
+            .unwrap();
+        let running = tokio::time::timeout(Duration::from_secs(3), async {
+            while store.get_job(job_id).unwrap().status() != JobStatus::Running
+                || !directory.join("ready").exists()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let _ = agent_stop.send(());
+        let stopped = tokio::time::timeout(Duration::from_secs(3), agent)
+            .await
+            .unwrap()
+            .unwrap();
+        server_stop.send(()).unwrap();
+        server.await.unwrap().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        running.unwrap();
+        stopped.unwrap();
+        assert_eq!(store.get_job(job_id).unwrap().status(), JobStatus::Stopped);
+        assert_eq!(
+            store.list_agents().unwrap()[0].availability(),
+            AgentAvailability::Idle
+        );
     }
 }

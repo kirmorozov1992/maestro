@@ -1,6 +1,3 @@
-// M6.1 ships this adapter before M6.2 wires it into the agent runtime.
-#![allow(dead_code)]
-
 use crate::{
     domain::{AgentId, AllocationId},
     transport::v1::{

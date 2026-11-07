@@ -314,7 +314,7 @@ fn validate_timestamps(
                 ..
             } => allocation.assigned_at(),
             JobEvent::Finished {
-                result: ProcessResult::Exited { .. },
+                result: ProcessResult::Exited { .. } | ProcessResult::ExecutionFailed,
                 ..
             } => allocation
                 .started_at()
@@ -381,6 +381,14 @@ fn terminal_event(event: &JobEvent) -> Option<(JobStatus, AllocationStatus, Term
                 },
             ))
         }
+        JobEvent::Finished {
+            result: ProcessResult::ExecutionFailed,
+            ..
+        } => Some((
+            JobStatus::Failed,
+            AllocationStatus::Failed,
+            TerminalResult::ExecutionFailed,
+        )),
         JobEvent::Stopped { .. } => Some((
             JobStatus::Stopped,
             AllocationStatus::Stopped,
@@ -580,6 +588,24 @@ fn plan_transition(
                 TerminalResult::Exited {
                     exit_code: *exit_code,
                 },
+            ))
+        }
+        JobEvent::Finished {
+            occurred_at,
+            result: ProcessResult::ExecutionFailed,
+            ..
+        } => {
+            if job.status() != JobStatus::Running {
+                return Err(invalid_transition(job, "finished"));
+            }
+            let allocation = require_allocation(job, allocation, AllocationStatus::Running, event)?;
+            Ok(terminal_transition(
+                job,
+                allocation,
+                *occurred_at,
+                JobStatus::Failed,
+                AllocationStatus::Failed,
+                TerminalResult::ExecutionFailed,
             ))
         }
         JobEvent::Stopped {
@@ -1806,5 +1832,75 @@ mod tests {
         assert_eq!(error.code(), "allocation_mismatch");
         assert_eq!(job, before_job);
         assert_eq!(replacement, before_replacement);
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_reporting_tests {
+    use super::*;
+    use crate::domain::JobSpec;
+    use std::num::NonZeroU32;
+
+    #[test]
+    fn execution_failure_requires_start_and_preserves_exact_terminal_duplicate() {
+        let job_id = JobId::new();
+        let agent_id = AgentId::new();
+        let allocation_id = AllocationId::new();
+        let at = Timestamp::from_unix_millis(100);
+        let mut job = Job::new(
+            job_id,
+            JobSpec::new("fixture", vec![], None, None).unwrap(),
+            at,
+        );
+        let mut allocation = Allocation::new(
+            allocation_id,
+            job_id,
+            agent_id,
+            NonZeroU32::new(1).unwrap(),
+            at,
+        );
+        apply_event(
+            &mut job,
+            Some(&mut allocation),
+            &JobEvent::Assigned {
+                job_id,
+                agent_id,
+                allocation_id,
+                occurred_at: at,
+            },
+        )
+        .unwrap();
+        let failed = JobEvent::Finished {
+            job_id,
+            agent_id,
+            allocation_id,
+            occurred_at: at,
+            result: ProcessResult::ExecutionFailed,
+        };
+        let before = job.clone();
+        assert!(apply_event(&mut job, Some(&mut allocation), &failed).is_err());
+        assert_eq!(job, before);
+        apply_event(
+            &mut job,
+            Some(&mut allocation),
+            &JobEvent::Started {
+                job_id,
+                agent_id,
+                allocation_id,
+                occurred_at: at,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            apply_event(&mut job, Some(&mut allocation), &failed),
+            Ok(ApplyOutcome::Applied)
+        );
+        assert_eq!(job.status(), JobStatus::Failed);
+        assert_eq!(allocation.status(), AllocationStatus::Failed);
+        assert_eq!(job.terminal_result(), Some(TerminalResult::ExecutionFailed));
+        assert_eq!(
+            apply_event(&mut job, Some(&mut allocation), &failed),
+            Ok(ApplyOutcome::Duplicate)
+        );
     }
 }

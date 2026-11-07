@@ -4,15 +4,12 @@ use crate::{
     transport::v1::{AllocationStatusV1, AssignmentResponse, JobStatusV1},
     worker::{
         client::{AgentClientError, AgentHttpClient},
+        executor::{Executor, ExecutorError},
         launch_registry::LaunchRegistry,
+        lifecycle::{AssignmentHandler, LifecycleRunner},
     },
 };
-use std::{
-    error::Error,
-    fmt,
-    future::{Future, pending},
-    time::Duration,
-};
+use std::{error::Error, fmt, future::Future, time::Duration};
 
 const AGENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -22,6 +19,7 @@ pub(crate) enum AgentRuntimeError {
     Logging(Box<dyn Error + Send + Sync>),
     Runtime(std::io::Error),
     LaunchRegistryPoisoned,
+    Executor(ExecutorError),
 }
 
 impl fmt::Display for AgentRuntimeError {
@@ -34,6 +32,9 @@ impl fmt::Display for AgentRuntimeError {
             ),
             Self::Logging(_) => formatter.write_str("agent logging could not be initialized"),
             Self::Runtime(_) => formatter.write_str("agent runtime could not be initialized"),
+            Self::Executor(error) => {
+                write!(formatter, "agent process handling failed: {}", error.code())
+            }
             Self::LaunchRegistryPoisoned => {
                 formatter.write_str("agent assignment registry is unavailable")
             }
@@ -72,6 +73,7 @@ impl Error for AgentRuntimeError {
             Self::Logging(source) => Some(source.as_ref()),
             Self::Runtime(source) => Some(source),
             Self::LaunchRegistryPoisoned => None,
+            Self::Executor(error) => Some(error),
         }
     }
 }
@@ -113,25 +115,25 @@ pub(crate) fn run(config: AgentConfig) -> Result<(), AgentRuntimeError> {
     runtime.block_on(run_with_shutdown(config, shutdown_signal()))
 }
 
-async fn run_with_shutdown<Shutdown>(
+pub(crate) async fn run_with_shutdown<Shutdown>(
     config: AgentConfig,
     shutdown: Shutdown,
 ) -> Result<(), AgentRuntimeError>
 where
     Shutdown: Future<Output = ()> + Send,
 {
-    run_with_handler(config, shutdown, defer_assignment).await
+    let executor = Executor::new(&config.working_dir).map_err(AgentRuntimeError::Executor)?;
+    run_with_handler(config, shutdown, LifecycleRunner::new(executor)).await
 }
 
-async fn run_with_handler<Shutdown, Handle, Handling>(
+async fn run_with_handler<Shutdown, Handle>(
     config: AgentConfig,
     shutdown: Shutdown,
-    handle_assignment: Handle,
+    mut handle_assignment: Handle,
 ) -> Result<(), AgentRuntimeError>
 where
     Shutdown: Future<Output = ()> + Send,
-    Handle: FnMut(AssignmentResponse) -> Handling + Send,
-    Handling: Future<Output = ()> + Send,
+    Handle: AssignmentHandler,
 {
     let client = AgentHttpClient::new(config.server_addr, AGENT_REQUEST_TIMEOUT)
         .map_err(AgentRuntimeError::Client)?;
@@ -148,26 +150,15 @@ where
     let result = tokio::select! {
         biased;
         () = shutdown => Ok(()),
-        result = agent.assignment_loop(config.poll_interval, handle_assignment) => result,
+        result = agent.assignment_loop(config.poll_interval, &mut handle_assignment) => result,
         () = agent.heartbeat_loop(config.heartbeat_interval) => Ok(()),
     };
+    handle_assignment
+        .shutdown(&agent.client)
+        .await
+        .map_err(AgentRuntimeError::Executor)?;
     tracing::info!(event = "agent_shutdown", agent_id = %agent.id);
     result
-}
-
-async fn defer_assignment(assignment: AssignmentResponse) {
-    tracing::warn!(
-        event = "agent_assignment_deferred",
-        agent_id = %assignment.allocation.agent_id,
-        job_id = %assignment.job.id,
-        allocation_id = %assignment.allocation.id,
-        reason = "executor_not_implemented"
-    );
-    // M6.5-M6.7 will replace this consumer with execution and terminal reporting.
-    // Retain the assignment without pretending it started or completed. The
-    // enclosing select drops this future on shutdown; there is no child process.
-    pending::<()>().await;
-    drop(assignment);
 }
 
 fn assignment_is_eligible(assignment: &AssignmentResponse, agent_id: AgentId) -> bool {
@@ -184,14 +175,13 @@ fn assignment_is_eligible(assignment: &AssignmentResponse, agent_id: AgentId) ->
 }
 
 impl RegisteredAgent {
-    async fn assignment_loop<Handle, Handling>(
+    async fn assignment_loop<Handle>(
         &self,
         interval: Duration,
-        mut handle_assignment: Handle,
+        handle_assignment: &mut Handle,
     ) -> Result<(), AgentRuntimeError>
     where
-        Handle: FnMut(AssignmentResponse) -> Handling + Send,
-        Handling: Future<Output = ()> + Send,
+        Handle: AssignmentHandler,
     {
         let registry = LaunchRegistry::default();
         loop {
@@ -228,7 +218,10 @@ impl RegisteredAgent {
             }
             // The consumer must resolve only after terminal handling completes.
             // Awaiting it owns the single local slot; heartbeat runs separately.
-            handle_assignment(assignment).await;
+            handle_assignment
+                .handle(&self.client, assignment)
+                .await
+                .map_err(AgentRuntimeError::Executor)?;
         }
     }
 
@@ -752,7 +745,7 @@ mod tests {
             async move {
                 let _ = shutdown_receiver.await;
             },
-            move |assignment| {
+            move |assignment: AssignmentResponse| {
                 sender
                     .send(assignment)
                     .expect("handoff observer should be open");
@@ -791,7 +784,7 @@ mod tests {
             async move {
                 let _ = shutdown_receiver.await;
             },
-            move |assignment| {
+            move |assignment: AssignmentResponse| {
                 let release = Arc::clone(&handler_release);
                 sender
                     .send(assignment)
@@ -843,7 +836,7 @@ mod tests {
             async move {
                 let _ = shutdown_receiver.await;
             },
-            move |assignment| {
+            move |assignment: AssignmentResponse| {
                 sender
                     .send(assignment)
                     .expect("handoff observer should be open");
@@ -906,7 +899,7 @@ mod tests {
             async move {
                 let _ = shutdown_receiver.await;
             },
-            move |assignment| {
+            move |assignment: AssignmentResponse| {
                 sender
                     .send(assignment)
                     .expect("handoff observer should be open");

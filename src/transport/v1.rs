@@ -44,12 +44,14 @@ pub(crate) struct RegisterAgentRequest {
 pub(crate) enum ProcessResultV1 {
     Exited { exit_code: i32 },
     SpawnFailed,
+    ExecutionFailed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StopReasonV1 {
     UserRequested,
+    AgentShutdown,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -100,6 +102,7 @@ impl AllocationEventRequest {
                 result: match result {
                     ProcessResultV1::Exited { exit_code } => ProcessResult::Exited { exit_code },
                     ProcessResultV1::SpawnFailed => ProcessResult::SpawnFailed,
+                    ProcessResultV1::ExecutionFailed => ProcessResult::ExecutionFailed,
                 },
             },
             Self::Stopped {
@@ -114,6 +117,7 @@ impl AllocationEventRequest {
                 occurred_at,
                 reason: match reason {
                     StopReasonV1::UserRequested => StopReason::UserRequested,
+                    StopReasonV1::AgentShutdown => StopReason::AgentShutdown,
                 },
             },
         }
@@ -207,6 +211,7 @@ impl From<DomainAgentAvailability> for AgentAvailabilityV1 {
 pub(crate) enum TerminalResultV1 {
     Exited { exit_code: i32 },
     SpawnFailed,
+    ExecutionFailed,
     Stopped,
     Lost,
 }
@@ -216,6 +221,7 @@ impl From<TerminalResult> for TerminalResultV1 {
         match result {
             TerminalResult::Exited { exit_code } => Self::Exited { exit_code },
             TerminalResult::SpawnFailed => Self::SpawnFailed,
+            TerminalResult::ExecutionFailed => Self::ExecutionFailed,
             TerminalResult::Stopped => Self::Stopped,
             TerminalResult::Lost => Self::Lost,
         }
@@ -339,17 +345,51 @@ impl From<&AgentSnapshot> for AgentResponse {
     }
 }
 
+/// Sensitive execution data is transported only to the assigned worker.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExecutionSpec {
+    pub(crate) command: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) env: Option<BTreeMap<String, String>>,
+    pub(crate) working_dir: Option<String>,
+}
+
+impl std::fmt::Debug for ExecutionSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionSpec").finish_non_exhaustive()
+    }
+}
+
+impl ExecutionSpec {
+    pub(crate) fn into_job_spec(self) -> Result<JobSpec, JobSpecError> {
+        JobSpec::new(self.command, self.args, self.env, self.working_dir)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct AssignmentResponse {
     pub(crate) job: JobDataResponse,
     pub(crate) allocation: AllocationResponse,
+    #[serde(default)]
+    pub(crate) execution: Option<ExecutionSpec>,
+    #[serde(default)]
+    pub(crate) server_time: Option<Timestamp>,
 }
 
-impl From<&AgentAssignment> for AssignmentResponse {
-    fn from(assignment: &AgentAssignment) -> Self {
+impl AssignmentResponse {
+    pub(crate) fn new(assignment: &AgentAssignment, server_time: Timestamp) -> Self {
+        let spec = &assignment.job.spec;
         Self {
             job: JobDataResponse::from(&assignment.job),
             allocation: AllocationResponse::from(&assignment.allocation),
+            execution: Some(ExecutionSpec {
+                command: spec.command().to_owned(),
+                args: spec.args().to_vec(),
+                env: spec.env().cloned(),
+                working_dir: spec.working_dir().map(str::to_owned),
+            }),
+            server_time: Some(server_time),
         }
     }
 }
@@ -819,7 +859,11 @@ mod tests {
             allocation: AllocationSnapshot::from(&allocation),
         };
 
-        let value = serde_json::to_value(super::AssignmentResponse::from(&assignment)).unwrap();
+        let value = serde_json::to_value(super::AssignmentResponse::new(
+            &assignment,
+            Timestamp::from_unix_millis(120),
+        ))
+        .unwrap();
         assert_eq!(value["job"]["status"], "pending");
         assert_eq!(value["allocation"]["status"], "assigned");
         assert_eq!(
@@ -893,5 +937,86 @@ mod tests {
             details,
             json!({"field": "working_dir", "code": "working_directory_too_long"})
         );
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_reporting_tests {
+    use super::*;
+    use crate::domain::{Allocation, Job};
+    use std::num::NonZeroU32;
+
+    #[test]
+    fn assignment_has_full_execution_spec_but_debug_and_job_projection_hide_env_values() {
+        let job = Job::new(
+            JobId::new(),
+            JobSpec::new(
+                "fixture",
+                vec![],
+                Some(BTreeMap::from([("TOKEN".into(), "private-env-67".into())])),
+                None,
+            )
+            .unwrap(),
+            Timestamp::from_unix_millis(100),
+        );
+        let allocation = Allocation::new(
+            AllocationId::new(),
+            job.id(),
+            AgentId::new(),
+            NonZeroU32::new(1).unwrap(),
+            Timestamp::from_unix_millis(110),
+        );
+        let assignment = AgentAssignment {
+            job: JobSnapshot::from(&job),
+            allocation: AllocationSnapshot::from(&allocation),
+        };
+        let response = AssignmentResponse::new(&assignment, Timestamp::from_unix_millis(150));
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["execution"]["env"]["TOKEN"], "private-env-67");
+        assert_eq!(json["server_time"], 150);
+        assert!(
+            !serde_json::to_string(&response.job)
+                .unwrap()
+                .contains("private-env-67")
+        );
+        assert!(!format!("{response:?}").contains("private-env-67"));
+        let decoded: AssignmentResponse = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(
+            decoded.execution.unwrap().into_job_spec().unwrap(),
+            *job.spec()
+        );
+        let mut legacy = json;
+        legacy.as_object_mut().unwrap().remove("execution");
+        legacy.as_object_mut().unwrap().remove("server_time");
+        let decoded: AssignmentResponse = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.execution.is_none());
+        assert!(decoded.server_time.is_none());
+    }
+
+    #[test]
+    fn execution_failed_and_agent_shutdown_map_without_fabricated_exit_code() {
+        let job_id = JobId::new();
+        let agent_id = AgentId::new();
+        let allocation_id = AllocationId::new();
+        let event: AllocationEventRequest=serde_json::from_value(serde_json::json!({"type":"finished","job_id":job_id,"agent_id":agent_id,"occurred_at":100,"result":{"type":"execution_failed"}})).unwrap();
+        assert!(matches!(
+            event.into_domain_event(allocation_id),
+            JobEvent::Finished {
+                result: ProcessResult::ExecutionFailed,
+                ..
+            }
+        ));
+        assert_eq!(
+            serde_json::to_value(TerminalResultV1::from(TerminalResult::ExecutionFailed)).unwrap(),
+            serde_json::json!({"type":"execution_failed"})
+        );
+        let event: AllocationEventRequest=serde_json::from_value(serde_json::json!({"type":"stopped","job_id":job_id,"agent_id":agent_id,"occurred_at":100,"reason":"agent_shutdown"})).unwrap();
+        assert!(matches!(
+            event.into_domain_event(allocation_id),
+            JobEvent::Stopped {
+                reason: StopReason::AgentShutdown,
+                ..
+            }
+        ));
     }
 }

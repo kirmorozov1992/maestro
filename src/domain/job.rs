@@ -100,6 +100,7 @@ pub enum JobStatus {
 pub enum TerminalResult {
     Exited { exit_code: i32 },
     SpawnFailed,
+    ExecutionFailed,
     Stopped,
     Lost,
 }
