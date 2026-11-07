@@ -91,7 +91,11 @@ async fn completed_allocation_does_not_deliver_old_stop() {
     server.await.unwrap().unwrap();
 }
 
-async fn submit_wait(address: SocketAddr, directory: &std::path::Path, mode: &str) -> JobId {
+pub(super) async fn submit_wait(
+    address: SocketAddr,
+    directory: &std::path::Path,
+    mode: &str,
+) -> JobId {
     let request = json!({"command":std::env::current_exe().unwrap(),"args":["--exact","worker::lifecycle::tests::process_fixture","--ignored","--nocapture"],"env":{"MAESTRO_M67_MODE":mode,"MAESTRO_M67_CODE":"0","MAESTRO_M67_READY":directory.join("ready"),"MAESTRO_M67_RELEASE":directory.join("release")}});
     let response = reqwest::Client::new()
         .post(format!("http://{address}/v1/jobs"))
@@ -106,7 +110,7 @@ async fn submit_wait(address: SocketAddr, directory: &std::path::Path, mode: &st
         .parse()
         .unwrap()
 }
-async fn await_status(store: &StateStore, id: JobId, status: JobStatus) {
+pub(super) async fn await_status(store: &StateStore, id: JobId, status: JobStatus) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while store.get_job(id).unwrap().status() != status {
             tokio::task::yield_now().await;

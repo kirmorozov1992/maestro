@@ -9,3 +9,5 @@ pub(crate) mod launch_registry;
 pub(crate) mod working_directory;
 
 mod lifecycle;
+
+mod shutdown;

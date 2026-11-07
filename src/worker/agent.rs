@@ -7,6 +7,7 @@ use crate::{
         executor::{Executor, ExecutorError},
         launch_registry::LaunchRegistry,
         lifecycle::{AssignmentHandler, LifecycleRunner},
+        shutdown::{ShutdownError, ShutdownSignals},
     },
 };
 use std::{error::Error, fmt, future::Future, time::Duration};
@@ -20,6 +21,7 @@ pub(crate) enum AgentRuntimeError {
     Runtime(std::io::Error),
     LaunchRegistryPoisoned,
     Executor(ExecutorError),
+    Shutdown(ShutdownError),
 }
 
 impl fmt::Display for AgentRuntimeError {
@@ -32,6 +34,7 @@ impl fmt::Display for AgentRuntimeError {
             ),
             Self::Logging(_) => formatter.write_str("agent logging could not be initialized"),
             Self::Runtime(_) => formatter.write_str("agent runtime could not be initialized"),
+            Self::Shutdown(error) => fmt::Display::fmt(error, formatter),
             Self::Executor(error) => {
                 write!(formatter, "agent process handling failed: {}", error.code())
             }
@@ -74,6 +77,7 @@ impl Error for AgentRuntimeError {
             Self::Runtime(source) => Some(source),
             Self::LaunchRegistryPoisoned => None,
             Self::Executor(error) => Some(error),
+            Self::Shutdown(error) => Some(error),
         }
     }
 }
@@ -112,36 +116,41 @@ pub(crate) fn run(config: AgentConfig) -> Result<(), AgentRuntimeError> {
         .build()
         .map_err(AgentRuntimeError::Runtime)?;
 
-    runtime.block_on(run_with_shutdown(config, shutdown_signal()))
+    runtime.block_on(async {
+        let signals = ShutdownSignals::install().map_err(AgentRuntimeError::Shutdown)?;
+        run_with_signal(config, signals.wait()).await
+    })
 }
 
-pub(crate) async fn run_with_shutdown<Shutdown>(
+async fn run_with_signal<Shutdown>(
     config: AgentConfig,
     shutdown: Shutdown,
 ) -> Result<(), AgentRuntimeError>
 where
-    Shutdown: Future<Output = ()> + Send,
+    Shutdown: Future<Output = Result<(), ShutdownError>> + Send,
 {
     let executor = Executor::new(&config.working_dir).map_err(AgentRuntimeError::Executor)?;
     let runner = LifecycleRunner::new(executor, config.poll_interval);
-    run_with_handler(config, shutdown, runner).await
+    run_until_shutdown(config, shutdown, runner).await
 }
 
-async fn run_with_handler<Shutdown, Handle>(
+async fn run_until_shutdown<Shutdown, Handle>(
     config: AgentConfig,
     shutdown: Shutdown,
     mut handle_assignment: Handle,
 ) -> Result<(), AgentRuntimeError>
 where
-    Shutdown: Future<Output = ()> + Send,
+    Shutdown: Future<Output = Result<(), ShutdownError>> + Send,
     Handle: AssignmentHandler,
 {
     let client = AgentHttpClient::new(config.server_addr, AGENT_REQUEST_TIMEOUT)
         .map_err(AgentRuntimeError::Client)?;
-    let response = client
-        .register(&config.agent_address)
-        .await
-        .map_err(AgentRuntimeError::Client)?;
+    tokio::pin!(shutdown);
+    let response = tokio::select! {
+        biased;
+        result = &mut shutdown => return result.map_err(AgentRuntimeError::Shutdown),
+        response = client.register(&config.agent_address) => response.map_err(AgentRuntimeError::Client)?,
+    };
     let agent = RegisteredAgent {
         client,
         id: response.id,
@@ -150,7 +159,7 @@ where
     tracing::info!(event = "agent_registered", agent_id = %agent.id);
     let result = tokio::select! {
         biased;
-        () = shutdown => Ok(()),
+        result = &mut shutdown => result.map_err(AgentRuntimeError::Shutdown),
         result = agent.assignment_loop(config.poll_interval, &mut handle_assignment) => result,
         () = agent.heartbeat_loop(config.heartbeat_interval) => Ok(()),
     };
@@ -261,19 +270,47 @@ fn initialize_logging() -> Result<(), AgentRuntimeError> {
         .map_err(AgentRuntimeError::Logging)
 }
 
-async fn shutdown_signal() {
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        tracing::error!(
-            event = "shutdown_signal_wait_failed",
-            signal = "ctrl_c",
-            error = %error
-        );
-    }
-    tracing::info!(event = "shutdown_signal_received");
+// Test adapters keep deterministic unit-triggered shutdown separate from OS
+// signal registration, which mutates process-global state.
+#[cfg(test)]
+pub(crate) async fn run_with_shutdown<Shutdown>(
+    config: AgentConfig,
+    shutdown: Shutdown,
+) -> Result<(), AgentRuntimeError>
+where
+    Shutdown: Future<Output = ()> + Send,
+{
+    run_with_signal(config, async {
+        shutdown.await;
+        Ok(())
+    })
+    .await
+}
+
+#[cfg(test)]
+async fn run_with_handler<Shutdown, Handle>(
+    config: AgentConfig,
+    shutdown: Shutdown,
+    handle: Handle,
+) -> Result<(), AgentRuntimeError>
+where
+    Shutdown: Future<Output = ()> + Send,
+    Handle: AssignmentHandler,
+{
+    run_until_shutdown(
+        config,
+        async {
+            shutdown.await;
+            Ok(())
+        },
+        handle,
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
+    mod shutdown_tests;
     use super::{
         HeartbeatConnectionState, SafeAgentClientError, run_with_handler, run_with_shutdown,
     };
@@ -343,6 +380,7 @@ mod tests {
         requests: Mutex<Vec<RecordedRequest>>,
         request_notification: Notify,
         registration_status: StatusCode,
+        registration_gate: Mutex<Option<Arc<Notify>>>,
         heartbeat_statuses: Mutex<VecDeque<StatusCode>>,
         assignment_replies: Mutex<VecDeque<PollReply>>,
     }
@@ -369,6 +407,7 @@ mod tests {
                 requests: Mutex::default(),
                 request_notification: Notify::new(),
                 registration_status,
+                registration_gate: Mutex::default(),
                 heartbeat_statuses: Mutex::new(heartbeat_statuses.into_iter().collect()),
                 assignment_replies: Mutex::default(),
             });
@@ -454,6 +493,10 @@ mod tests {
 
     async fn register(State(state): State<Arc<MockState>>, Json(body): Json<Value>) -> Response {
         record(&state, Method::POST, "/v1/agents/register", body).await;
+        let gate = state.registration_gate.lock().await.clone();
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
         if state.registration_status == StatusCode::CREATED {
             response(
                 state.registration_status,
@@ -1008,3 +1051,6 @@ mod tests {
         mock.stop().await;
     }
 }
+
+#[cfg(all(test, unix))]
+pub(crate) mod test_support;

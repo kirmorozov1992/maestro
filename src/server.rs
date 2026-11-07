@@ -547,6 +547,8 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    mod shutdown_tests;
     mod stop_tests;
     use crate::{
         config::ServerConfig,
