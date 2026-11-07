@@ -6,20 +6,13 @@ use std::{
 
 /// In-memory admission guard for one agent process lifetime.
 ///
-/// M6.4's agent loop must claim an allocation before handing it to the executor.
+/// The agent loop claims an allocation before handing it to its local consumer.
 /// The guard intentionally does not survive a process restart.
 #[derive(Default)]
 pub(crate) struct LaunchRegistry {
     claimed: Mutex<HashSet<AllocationId>>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "M6.4 agent loop will claim allocations before execution"
-    )
-)]
 impl LaunchRegistry {
     pub(crate) fn claim(
         &self,

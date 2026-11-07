@@ -1,9 +1,18 @@
 use crate::{
     config::AgentConfig,
     domain::AgentId,
-    worker::client::{AgentClientError, AgentHttpClient},
+    transport::v1::{AllocationStatusV1, AssignmentResponse, JobStatusV1},
+    worker::{
+        client::{AgentClientError, AgentHttpClient},
+        launch_registry::LaunchRegistry,
+    },
 };
-use std::{error::Error, fmt, future::Future, time::Duration};
+use std::{
+    error::Error,
+    fmt,
+    future::{Future, pending},
+    time::Duration,
+};
 
 const AGENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -12,6 +21,7 @@ pub(crate) enum AgentRuntimeError {
     Client(AgentClientError),
     Logging(Box<dyn Error + Send + Sync>),
     Runtime(std::io::Error),
+    LaunchRegistryPoisoned,
 }
 
 impl fmt::Display for AgentRuntimeError {
@@ -24,6 +34,9 @@ impl fmt::Display for AgentRuntimeError {
             ),
             Self::Logging(_) => formatter.write_str("agent logging could not be initialized"),
             Self::Runtime(_) => formatter.write_str("agent runtime could not be initialized"),
+            Self::LaunchRegistryPoisoned => {
+                formatter.write_str("agent assignment registry is unavailable")
+            }
         }
     }
 }
@@ -58,6 +71,7 @@ impl Error for AgentRuntimeError {
             Self::Client(source) => Some(source),
             Self::Logging(source) => Some(source.as_ref()),
             Self::Runtime(source) => Some(source),
+            Self::LaunchRegistryPoisoned => None,
         }
     }
 }
@@ -106,6 +120,19 @@ async fn run_with_shutdown<Shutdown>(
 where
     Shutdown: Future<Output = ()> + Send,
 {
+    run_with_handler(config, shutdown, defer_assignment).await
+}
+
+async fn run_with_handler<Shutdown, Handle, Handling>(
+    config: AgentConfig,
+    shutdown: Shutdown,
+    handle_assignment: Handle,
+) -> Result<(), AgentRuntimeError>
+where
+    Shutdown: Future<Output = ()> + Send,
+    Handle: FnMut(AssignmentResponse) -> Handling + Send,
+    Handling: Future<Output = ()> + Send,
+{
     let client = AgentHttpClient::new(config.server_addr, AGENT_REQUEST_TIMEOUT)
         .map_err(AgentRuntimeError::Client)?;
     let response = client
@@ -118,45 +145,112 @@ where
     };
 
     tracing::info!(event = "agent_registered", agent_id = %agent.id);
-    agent
-        .heartbeat_loop(config.heartbeat_interval, shutdown)
-        .await;
-    Ok(())
+    let result = tokio::select! {
+        biased;
+        () = shutdown => Ok(()),
+        result = agent.assignment_loop(config.poll_interval, handle_assignment) => result,
+        () = agent.heartbeat_loop(config.heartbeat_interval) => Ok(()),
+    };
+    tracing::info!(event = "agent_shutdown", agent_id = %agent.id);
+    result
+}
+
+async fn defer_assignment(assignment: AssignmentResponse) {
+    tracing::warn!(
+        event = "agent_assignment_deferred",
+        agent_id = %assignment.allocation.agent_id,
+        job_id = %assignment.job.id,
+        allocation_id = %assignment.allocation.id,
+        reason = "executor_not_implemented"
+    );
+    // M6.5-M6.7 will replace this consumer with execution and terminal reporting.
+    // Retain the assignment without pretending it started or completed. The
+    // enclosing select drops this future on shutdown; there is no child process.
+    pending::<()>().await;
+    drop(assignment);
+}
+
+fn assignment_is_eligible(assignment: &AssignmentResponse, agent_id: AgentId) -> bool {
+    assignment.allocation.agent_id == agent_id
+        && assignment.allocation.job_id == assignment.job.id
+        && assignment.job.status == JobStatusV1::Assigned
+        && assignment.allocation.status == AllocationStatusV1::Assigned
+        && assignment.allocation.attempt > 0
+        && assignment.job.started_at.is_none()
+        && assignment.job.finished_at.is_none()
+        && assignment.job.terminal_result.is_none()
+        && assignment.allocation.started_at.is_none()
+        && assignment.allocation.finished_at.is_none()
 }
 
 impl RegisteredAgent {
-    async fn heartbeat_loop<Shutdown>(&self, interval: Duration, shutdown: Shutdown)
+    async fn assignment_loop<Handle, Handling>(
+        &self,
+        interval: Duration,
+        mut handle_assignment: Handle,
+    ) -> Result<(), AgentRuntimeError>
     where
-        Shutdown: Future<Output = ()> + Send,
+        Handle: FnMut(AssignmentResponse) -> Handling + Send,
+        Handling: Future<Output = ()> + Send,
     {
-        tokio::pin!(shutdown);
+        let registry = LaunchRegistry::default();
+        loop {
+            // Wait after every result, including empty, duplicate and failure,
+            // to prevent a busy loop. The first poll uses the same interval.
+            tokio::time::sleep(interval).await;
+            let assignment = match self.client.next_assignment(self.id).await {
+                Ok(Some(assignment)) => assignment,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        event = "agent_assignment_poll_failed",
+                        agent_id = %self.id,
+                        error = %SafeAgentClientError(&error)
+                    );
+                    continue;
+                }
+            };
+            if !assignment_is_eligible(&assignment, self.id) {
+                tracing::warn!(event = "agent_assignment_rejected", agent_id = %self.id);
+                continue;
+            }
+            let claimed = registry
+                .claim(assignment.allocation.id)
+                .map_err(|_| AgentRuntimeError::LaunchRegistryPoisoned)?;
+            if !claimed {
+                tracing::debug!(
+                    event = "agent_assignment_duplicate",
+                    agent_id = %self.id,
+                    job_id = %assignment.job.id,
+                    allocation_id = %assignment.allocation.id
+                );
+                continue;
+            }
+            // The consumer must resolve only after terminal handling completes.
+            // Awaiting it owns the single local slot; heartbeat runs separately.
+            handle_assignment(assignment).await;
+        }
+    }
+
+    async fn heartbeat_loop(&self, interval: Duration) {
         let mut connection_state = HeartbeatConnectionState::Connected;
         loop {
-            tokio::select! {
-                () = &mut shutdown => {
-                    tracing::info!(event = "agent_shutdown", agent_id = %self.id);
-                    return;
+            tokio::time::sleep(interval).await;
+            match self.client.heartbeat(self.id).await {
+                Ok(_) => {
+                    if connection_state.observe(true) == Some(HeartbeatConnectionState::Connected) {
+                        tracing::info!(event = "agent_connected", agent_id = %self.id);
+                    }
                 }
-                () = tokio::time::sleep(interval) => {
-                    match self.client.heartbeat(self.id).await {
-                        Ok(_) => {
-                            if connection_state.observe(true)
-                                == Some(HeartbeatConnectionState::Connected)
-                            {
-                                tracing::info!(event = "agent_connected", agent_id = %self.id);
-                            }
-                        }
-                        Err(error) => {
-                            if connection_state.observe(false)
-                                == Some(HeartbeatConnectionState::Disconnected)
-                            {
-                                tracing::warn!(
-                                    event = "agent_disconnected",
-                                    agent_id = %self.id,
-                                    error = %SafeAgentClientError(&error)
-                                );
-                            }
-                        }
+                Err(error) => {
+                    if connection_state.observe(false)
+                        == Some(HeartbeatConnectionState::Disconnected)
+                    {
+                        tracing::warn!(
+                            event = "agent_disconnected",
+                            agent_id = %self.id,
+                            error = %SafeAgentClientError(&error)
+                        );
                     }
                 }
             }
@@ -186,24 +280,33 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::{HeartbeatConnectionState, SafeAgentClientError, run_with_shutdown};
-    use crate::{config::AgentConfig, domain::AgentId, worker::client::AgentHttpClient};
+    use super::{
+        HeartbeatConnectionState, SafeAgentClientError, run_with_handler, run_with_shutdown,
+    };
+    use crate::{
+        config::AgentConfig, domain::AgentId, transport::v1::AssignmentResponse,
+        worker::client::AgentHttpClient,
+    };
     use axum::{
         Json, Router,
         body::Body,
         extract::{Path, State},
         http::{Method, StatusCode},
         response::{IntoResponse, Response},
-        routing::post,
+        routing::{get, post},
     };
     use serde_json::{Value, json};
     use std::{
-        collections::VecDeque, future::pending, net::SocketAddr, path::PathBuf, sync::Arc,
-        time::Duration,
+        collections::VecDeque,
+        future::pending,
+        net::SocketAddr,
+        path::PathBuf,
+        sync::Arc,
+        time::{Duration, Instant},
     };
     use tokio::{
         net::TcpListener,
-        sync::{Mutex, Notify, oneshot},
+        sync::{Mutex, Notify, mpsc, oneshot},
         task::JoinHandle,
     };
 
@@ -232,6 +335,14 @@ mod tests {
         method: Method,
         path: String,
         body: Value,
+        received_at: Instant,
+    }
+
+    enum PollReply {
+        Empty,
+        Error,
+        Assignment(Box<AssignmentResponse>),
+        Stalled(Arc<Notify>),
     }
 
     struct MockState {
@@ -239,6 +350,7 @@ mod tests {
         request_notification: Notify,
         registration_status: StatusCode,
         heartbeat_statuses: Mutex<VecDeque<StatusCode>>,
+        assignment_replies: Mutex<VecDeque<PollReply>>,
     }
 
     struct MockServer {
@@ -264,6 +376,7 @@ mod tests {
                 request_notification: Notify::new(),
                 registration_status,
                 heartbeat_statuses: Mutex::new(heartbeat_statuses.into_iter().collect()),
+                assignment_replies: Mutex::default(),
             });
             let (shutdown, shutdown_receiver) = oneshot::channel();
             let task = tokio::spawn({
@@ -286,13 +399,35 @@ mod tests {
             }
         }
 
+        async fn enqueue_assignments(&self, replies: impl IntoIterator<Item = PollReply>) {
+            self.state.assignment_replies.lock().await.extend(replies);
+        }
+
         async fn wait_for_requests(&self, count: usize) -> Vec<RecordedRequest> {
+            self.wait_for_matching_requests(count, |_| true).await
+        }
+
+        async fn wait_for_polls(&self, count: usize) -> Vec<RecordedRequest> {
+            self.wait_for_matching_requests(count, |request| request.method == Method::GET)
+                .await
+        }
+
+        async fn wait_for_matching_requests(
+            &self,
+            count: usize,
+            matches: impl Fn(&RecordedRequest) -> bool,
+        ) -> Vec<RecordedRequest> {
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
                     let notified = self.state.request_notification.notified();
                     let requests = self.state.requests.lock().await;
-                    if requests.len() >= count {
-                        return requests.clone();
+                    let matching: Vec<_> = requests
+                        .iter()
+                        .filter(|request| matches(request))
+                        .cloned()
+                        .collect();
+                    if matching.len() >= count {
+                        return matching;
                     }
                     drop(requests);
                     notified.await;
@@ -316,6 +451,10 @@ mod tests {
         Router::new()
             .route("/v1/agents/register", post(register))
             .route("/v1/agents/{agent_id}/heartbeat", post(heartbeat))
+            .route(
+                "/v1/agents/{agent_id}/assignments/next",
+                get(poll_assignment),
+            )
             .with_state(state)
     }
 
@@ -355,11 +494,40 @@ mod tests {
         }
     }
 
+    async fn poll_assignment(
+        State(state): State<Arc<MockState>>,
+        Path(agent_id): Path<String>,
+    ) -> Response {
+        record(
+            &state,
+            Method::GET,
+            &format!("/v1/agents/{agent_id}/assignments/next"),
+            Value::Null,
+        )
+        .await;
+        let reply = state
+            .assignment_replies
+            .lock()
+            .await
+            .pop_front()
+            .unwrap_or(PollReply::Empty);
+        match reply {
+            PollReply::Empty => StatusCode::NO_CONTENT.into_response(),
+            PollReply::Error => error_response(StatusCode::SERVICE_UNAVAILABLE),
+            PollReply::Assignment(assignment) => Json(assignment).into_response(),
+            PollReply::Stalled(release) => {
+                release.notified().await;
+                StatusCode::NO_CONTENT.into_response()
+            }
+        }
+    }
+
     async fn record(state: &MockState, method: Method, path: &str, body: Value) {
         state.requests.lock().await.push(RecordedRequest {
             method,
             path: path.to_owned(),
             body,
+            received_at: Instant::now(),
         });
         state.request_notification.notify_one();
     }
@@ -407,7 +575,9 @@ mod tests {
             },
         ));
 
-        let requests = mock.wait_for_requests(2).await;
+        let requests = mock
+            .wait_for_matching_requests(2, |r| r.method == Method::POST)
+            .await;
         let _ = shutdown_sender.send(());
         agent
             .await
@@ -457,7 +627,9 @@ mod tests {
             },
         ));
 
-        let requests = mock.wait_for_requests(3).await;
+        let requests = mock
+            .wait_for_matching_requests(3, |r| r.method == Method::POST)
+            .await;
         let _ = shutdown_sender.send(());
         agent
             .await
@@ -512,6 +684,333 @@ mod tests {
             .expect("agent runtime should stop cleanly");
 
         assert_eq!(requests.len(), 1);
+        mock.stop().await;
+    }
+
+    const JOB_ID: &str = "550e8400-e29b-41d4-a716-446655440002";
+    const ALLOCATION_ID: &str = "550e8400-e29b-41d4-a716-446655440003";
+    const SECOND_ALLOCATION_ID: &str = "550e8400-e29b-41d4-a716-446655440004";
+
+    fn assignment(allocation_id: &str) -> AssignmentResponse {
+        serde_json::from_value(json!({
+            "job": {
+                "id": JOB_ID,
+                "spec": {"command": "private-command", "args": ["private-argument"], "env_keys": ["PRIVATE_KEY"], "working_dir": null},
+                "status": "assigned", "submitted_at": 1, "updated_at": 2,
+                "started_at": null, "finished_at": null, "terminal_result": null
+            },
+            "allocation": {
+                "id": allocation_id, "job_id": JOB_ID, "agent_id": AGENT_ID,
+                "status": "assigned", "attempt": 1, "assigned_at": 2,
+                "started_at": null, "finished_at": null
+            }
+        })).expect("test assignment should match API v1")
+    }
+
+    fn polling_config(address: SocketAddr, interval: Duration) -> AgentConfig {
+        let mut config = agent_config(address, Duration::from_millis(10));
+        config.poll_interval = interval;
+        config
+    }
+
+    async fn receive_assignment(
+        receiver: &mut mpsc::UnboundedReceiver<AssignmentResponse>,
+    ) -> AssignmentResponse {
+        tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("assignment should arrive")
+            .expect("handler should remain available")
+    }
+
+    async fn stop_agent(
+        sender: oneshot::Sender<()>,
+        agent: JoinHandle<Result<(), super::AgentRuntimeError>>,
+    ) {
+        let _ = sender.send(());
+        tokio::time::timeout(Duration::from_millis(200), agent)
+            .await
+            .expect("shutdown should cancel in-flight work promptly")
+            .expect("agent task should finish")
+            .expect("agent should stop cleanly");
+    }
+
+    #[tokio::test]
+    async fn polling_waits_between_empty_and_failed_responses_then_hands_off_assignment() {
+        let mock = MockServer::start(StatusCode::CREATED, []).await;
+        let expected = assignment(ALLOCATION_ID);
+        mock.enqueue_assignments([
+            PollReply::Empty,
+            PollReply::Error,
+            PollReply::Assignment(Box::new(expected.clone())),
+        ])
+        .await;
+        let interval = Duration::from_millis(30);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let agent = tokio::spawn(run_with_handler(
+            polling_config(mock.address, interval),
+            async move {
+                let _ = shutdown_receiver.await;
+            },
+            move |assignment| {
+                sender
+                    .send(assignment)
+                    .expect("handoff observer should be open");
+                pending::<()>()
+            },
+        ));
+
+        assert_eq!(receive_assignment(&mut receiver).await, expected);
+        let polls = mock.wait_for_polls(3).await;
+        for pair in polls.windows(2) {
+            assert!(pair[1].received_at.duration_since(pair[0].received_at) >= interval);
+        }
+        assert!(
+            polls
+                .iter()
+                .all(|r| r.path == format!("/v1/agents/{AGENT_ID}/assignments/next"))
+        );
+        stop_agent(shutdown_sender, agent).await;
+        mock.stop().await;
+    }
+
+    #[tokio::test]
+    async fn assignment_handoff_blocks_further_polling_but_keeps_heartbeat_alive() {
+        let mock = MockServer::start(StatusCode::CREATED, []).await;
+        mock.enqueue_assignments([
+            PollReply::Assignment(Box::new(assignment(ALLOCATION_ID))),
+            PollReply::Assignment(Box::new(assignment(SECOND_ALLOCATION_ID))),
+        ])
+        .await;
+        let release = Arc::new(Notify::new());
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let handler_release = Arc::clone(&release);
+        let agent = tokio::spawn(run_with_handler(
+            polling_config(mock.address, Duration::from_millis(5)),
+            async move {
+                let _ = shutdown_receiver.await;
+            },
+            move |assignment| {
+                let release = Arc::clone(&handler_release);
+                sender
+                    .send(assignment)
+                    .expect("handoff observer should be open");
+                async move {
+                    release.notified().await;
+                }
+            },
+        ));
+
+        assert_eq!(
+            receive_assignment(&mut receiver).await.allocation.id,
+            ALLOCATION_ID.parse().unwrap()
+        );
+        mock.wait_for_matching_requests(4, |r| r.path.ends_with("/heartbeat"))
+            .await;
+        assert_eq!(
+            mock.state
+                .requests
+                .lock()
+                .await
+                .iter()
+                .filter(|r| r.method == Method::GET)
+                .count(),
+            1
+        );
+        release.notify_one();
+        assert_eq!(
+            receive_assignment(&mut receiver).await.allocation.id,
+            SECOND_ALLOCATION_ID.parse().unwrap()
+        );
+        stop_agent(shutdown_sender, agent).await;
+        mock.stop().await;
+    }
+
+    #[tokio::test]
+    async fn completed_handoff_does_not_readmit_a_duplicate_allocation() {
+        let mock = MockServer::start(StatusCode::CREATED, []).await;
+        mock.enqueue_assignments([
+            PollReply::Assignment(Box::new(assignment(ALLOCATION_ID))),
+            PollReply::Assignment(Box::new(assignment(ALLOCATION_ID))),
+            PollReply::Assignment(Box::new(assignment(SECOND_ALLOCATION_ID))),
+        ])
+        .await;
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let agent = tokio::spawn(run_with_handler(
+            polling_config(mock.address, Duration::from_millis(5)),
+            async move {
+                let _ = shutdown_receiver.await;
+            },
+            move |assignment| {
+                sender
+                    .send(assignment)
+                    .expect("handoff observer should be open");
+                async {}
+            },
+        ));
+
+        assert_eq!(
+            receive_assignment(&mut receiver).await.allocation.id,
+            ALLOCATION_ID.parse().unwrap()
+        );
+        assert_eq!(
+            receive_assignment(&mut receiver).await.allocation.id,
+            SECOND_ALLOCATION_ID.parse().unwrap()
+        );
+        assert!(receiver.try_recv().is_err());
+        stop_agent(shutdown_sender, agent).await;
+        mock.stop().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_assignment_snapshots_are_skipped_without_consuming_the_claim() {
+        use crate::domain::Timestamp;
+        use crate::transport::v1::{AllocationStatusV1, JobStatusV1};
+        let mock = MockServer::start(StatusCode::CREATED, []).await;
+        let valid = assignment(ALLOCATION_ID);
+        let mut invalid = Vec::new();
+        let mut value = valid.clone();
+        value.allocation.agent_id = JOB_ID.parse().unwrap();
+        invalid.push(value);
+        let mut value = valid.clone();
+        value.allocation.job_id = AGENT_ID.parse().unwrap();
+        invalid.push(value);
+        let mut value = valid.clone();
+        value.job.status = JobStatusV1::Running;
+        invalid.push(value);
+        let mut value = valid.clone();
+        value.allocation.status = AllocationStatusV1::Running;
+        invalid.push(value);
+        let mut value = valid.clone();
+        value.allocation.attempt = 0;
+        invalid.push(value);
+        let mut value = valid.clone();
+        value.job.started_at = Some(Timestamp::from_unix_millis(3));
+        invalid.push(value);
+        let mut value = valid.clone();
+        value.allocation.finished_at = Some(Timestamp::from_unix_millis(3));
+        invalid.push(value);
+        mock.enqueue_assignments(
+            invalid
+                .into_iter()
+                .chain([valid.clone()])
+                .map(|a| PollReply::Assignment(Box::new(a))),
+        )
+        .await;
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let agent = tokio::spawn(run_with_handler(
+            polling_config(mock.address, Duration::from_millis(3)),
+            async move {
+                let _ = shutdown_receiver.await;
+            },
+            move |assignment| {
+                sender
+                    .send(assignment)
+                    .expect("handoff observer should be open");
+                pending::<()>()
+            },
+        ));
+
+        assert_eq!(receive_assignment(&mut receiver).await, valid);
+        assert_eq!(mock.wait_for_polls(8).await.len(), 8);
+        assert!(receiver.try_recv().is_err());
+        stop_agent(shutdown_sender, agent).await;
+        mock.stop().await;
+    }
+
+    #[tokio::test]
+    async fn default_runtime_defers_one_assignment_and_continues_heartbeat_until_shutdown() {
+        let mock = MockServer::start(StatusCode::CREATED, []).await;
+        mock.enqueue_assignments([PollReply::Assignment(Box::new(assignment(ALLOCATION_ID)))])
+            .await;
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let agent = tokio::spawn(run_with_shutdown(
+            polling_config(mock.address, Duration::from_millis(5)),
+            async move {
+                let _ = shutdown_receiver.await;
+            },
+        ));
+
+        mock.wait_for_polls(1).await;
+        mock.wait_for_matching_requests(4, |r| r.path.ends_with("/heartbeat"))
+            .await;
+        assert_eq!(
+            mock.state
+                .requests
+                .lock()
+                .await
+                .iter()
+                .filter(|r| r.method == Method::GET)
+                .count(),
+            1
+        );
+        stop_agent(shutdown_sender, agent).await;
+        mock.stop().await;
+    }
+
+    #[tokio::test]
+    async fn pending_poll_does_not_block_heartbeat_or_shutdown() {
+        let mock = MockServer::start(StatusCode::CREATED, []).await;
+        let release = Arc::new(Notify::new());
+        mock.enqueue_assignments([PollReply::Stalled(Arc::clone(&release))])
+            .await;
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let agent = tokio::spawn(run_with_shutdown(
+            polling_config(mock.address, Duration::from_millis(5)),
+            async move {
+                let _ = shutdown_receiver.await;
+            },
+        ));
+
+        mock.wait_for_polls(1).await;
+        mock.wait_for_matching_requests(2, |r| r.path.ends_with("/heartbeat"))
+            .await;
+        stop_agent(shutdown_sender, agent).await;
+        release.notify_one();
+        mock.stop().await;
+    }
+
+    #[tokio::test]
+    async fn poll_error_summary_does_not_echo_server_response() {
+        let mock = MockServer::start(StatusCode::CREATED, []).await;
+        mock.enqueue_assignments([PollReply::Error]).await;
+        let client = AgentHttpClient::new(mock.address, Duration::from_secs(1)).unwrap();
+        let error = client
+            .next_assignment(AGENT_ID.parse().unwrap())
+            .await
+            .unwrap_err();
+        let summary = SafeAgentClientError(&error).to_string();
+        assert!(summary.contains("503"));
+        assert!(!summary.contains(ECHOED_ERROR_CODE));
+        assert!(!summary.contains(ECHOED_ERROR_MESSAGE));
+        mock.stop().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_poll_interval_without_issuing_a_poll() {
+        let mock = MockServer::start(StatusCode::CREATED, []).await;
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let agent = tokio::spawn(run_with_shutdown(
+            polling_config(mock.address, Duration::from_secs(60)),
+            async move {
+                let _ = shutdown_receiver.await;
+            },
+        ));
+        mock.wait_for_requests(1).await;
+        stop_agent(shutdown_sender, agent).await;
+        assert_eq!(
+            mock.state
+                .requests
+                .lock()
+                .await
+                .iter()
+                .filter(|r| r.method == Method::GET)
+                .count(),
+            0
+        );
         mock.stop().await;
     }
 }
