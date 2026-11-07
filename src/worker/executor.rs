@@ -1,5 +1,10 @@
 //! Local process ownership. Runtime assignment/reporting wiring follows in M6.7.
 
+mod output;
+
+use output::BoundedCapture;
+pub(crate) use output::CapturedOutput;
+
 use crate::{
     domain::JobSpec,
     worker::working_directory::{WorkingDirectoryError, resolve_job_working_directory},
@@ -9,11 +14,16 @@ use std::{
     fmt, io,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
+    sync::Arc,
+    time::Duration,
 };
 use tokio::{
-    process::{Child, Command},
+    process::{Child, ChildStderr, ChildStdout, Command},
     runtime::{Handle, TryCurrentError},
+    time::Instant,
 };
+
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 
 pub(crate) enum ExecutorError {
     WorkingDirectory(WorkingDirectoryError),
@@ -24,6 +34,8 @@ pub(crate) enum ExecutorError {
     Spawn(io::Error),
     Wait(io::Error),
     Terminate(io::Error),
+    Stdout(Arc<io::Error>),
+    Stderr(Arc<io::Error>),
 }
 
 impl ExecutorError {
@@ -42,6 +54,8 @@ impl ExecutorError {
             },
             Self::Wait(_) => "process_wait_failed",
             Self::Terminate(_) => "process_terminate_failed",
+            Self::Stdout(_) => "process_stdout_read_failed",
+            Self::Stderr(_) => "process_stderr_read_failed",
         }
     }
 }
@@ -57,6 +71,8 @@ impl fmt::Display for ExecutorError {
             Self::Spawn(_) => "process could not be started",
             Self::Wait(_) => "process completion could not be observed",
             Self::Terminate(_) => "process could not be terminated",
+            Self::Stdout(_) => "process stdout could not be read",
+            Self::Stderr(_) => "process stderr could not be read",
         };
         formatter.write_str(message)
     }
@@ -78,6 +94,7 @@ impl Error for ExecutorError {
             Self::WorkingDirectory(error) => Some(error),
             Self::RuntimeUnavailable(error) => Some(error),
             Self::Spawn(error) | Self::Wait(error) | Self::Terminate(error) => Some(error),
+            Self::Stdout(error) | Self::Stderr(error) => Some(error.as_ref()),
             Self::InvalidCommand | Self::InvalidArgument | Self::InvalidEnvironment => None,
         }
     }
@@ -100,7 +117,7 @@ impl Executor {
         Ok(Self { agent_root })
     }
 
-    /// Must be called inside a Tokio runtime with its I/O driver enabled.
+    /// Must be called inside a Tokio runtime with I/O and time drivers enabled.
     pub(crate) fn spawn(&self, spec: &JobSpec) -> Result<RunningProcess, ExecutorError> {
         validate_process_input(spec)?;
         let working_directory =
@@ -125,8 +142,8 @@ impl Executor {
             .args(spec.args())
             .current_dir(working_directory)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         // Preserve normal inheritance; override only explicitly provided keys.
         if let Some(environment) = spec.env() {
@@ -134,7 +151,12 @@ impl Executor {
         }
         command
             .spawn()
-            .map(|child| RunningProcess { child })
+            .map(|mut child| RunningProcess {
+                stdout: BoundedCapture::new(child.stdout.take()),
+                stderr: BoundedCapture::new(child.stderr.take()),
+                child,
+                output_deadline: None,
+            })
             .map_err(ExecutorError::Spawn)
     }
 }
@@ -161,6 +183,9 @@ fn validate_process_input(spec: &JobSpec) -> Result<(), ExecutorError> {
 /// termination of descendants. Cancelling wait retains ownership in this value.
 pub(crate) struct RunningProcess {
     child: Child,
+    stdout: BoundedCapture<ChildStdout>,
+    stderr: BoundedCapture<ChildStderr>,
+    output_deadline: Option<Instant>,
 }
 
 impl fmt::Debug for RunningProcess {
@@ -177,8 +202,55 @@ impl RunningProcess {
         self.child.id()
     }
 
+    pub(crate) fn stdout(&self) -> &CapturedOutput {
+        self.stdout.output()
+    }
+
+    pub(crate) fn stderr(&self) -> &CapturedOutput {
+        self.stderr.output()
+    }
+
+    /// Drive child completion and both pipes together. Stream state lives in
+    /// this owner so cancellation never discards previously collected bytes.
     pub(crate) async fn wait(&mut self) -> Result<ExitStatus, ExecutorError> {
-        self.child.wait().await.map_err(ExecutorError::Wait)
+        let (status, timed_out) = {
+            let stdout = &mut self.stdout;
+            let stderr = &mut self.stderr;
+            let drains = async {
+                tokio::join!(stdout.drain(), stderr.drain());
+            };
+            let child_wait = self.child.wait();
+            tokio::pin!(drains, child_wait);
+            let (status, drained) = tokio::select! {
+                status = &mut child_wait => (status, false),
+                () = &mut drains => (child_wait.await, true),
+            };
+            let status = status.map_err(ExecutorError::Wait)?;
+            let timed_out = if drained {
+                false
+            } else {
+                let deadline = *self
+                    .output_deadline
+                    .get_or_insert_with(|| Instant::now() + OUTPUT_DRAIN_GRACE);
+                tokio::time::timeout_at(deadline, drains).await.is_err()
+            };
+            (status, timed_out)
+        };
+        if timed_out {
+            // A descendant may retain a pipe after the direct child exits.
+            // Only still-open streams get incomplete-output metadata.
+            self.stdout.close_on_timeout();
+            self.stderr.close_on_timeout();
+        }
+        // Arc clones preserve the same source across repeated waits without
+        // exposing arbitrary I/O messages in public Display/Debug.
+        if let Some(error) = self.stdout.error() {
+            return Err(ExecutorError::Stdout(Arc::clone(error)));
+        }
+        if let Some(error) = self.stderr.error() {
+            return Err(ExecutorError::Stderr(Arc::clone(error)));
+        }
+        Ok(status)
     }
 
     /// Force termination and reap the direct child, without implementing job
@@ -191,7 +263,10 @@ impl RunningProcess {
 
 #[cfg(test)]
 mod tests {
-    use super::Executor;
+    use super::{
+        Executor, RunningProcess,
+        output::{BoundedCapture, OUTPUT_LIMIT_BYTES},
+    };
     use crate::domain::JobSpec;
     use serde_json::{Value, json};
     use std::{
@@ -301,7 +376,7 @@ mod tests {
             "inspect" => {
                 let mut input = Vec::new();
                 io::stdin().read_to_end(&mut input).unwrap();
-                // Null streams must not accumulate output or require a reader.
+                // Large writes exercise concurrent draining as well as cwd/args handling.
                 let output_bytes = vec![b'x'; 128 * 1024];
                 io::stdout().write_all(&output_bytes).unwrap();
                 io::stderr().write_all(&output_bytes).unwrap();
@@ -317,6 +392,39 @@ mod tests {
                     .unwrap(),
                 )
                 .unwrap();
+            }
+            "emit" | "emit_wait" => {
+                let stdout_bytes: usize = std::env::var("MAESTRO_EXECUTOR_STDOUT_BYTES")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let stderr_bytes: usize = std::env::var("MAESTRO_EXECUTOR_STDERR_BYTES")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let mut stdout = io::stdout().lock();
+                let mut stderr = io::stderr().lock();
+                let stdout_chunk = [b'o'; 8192];
+                let stderr_chunk = [b'e'; 8192];
+                for chunk in (0..stdout_bytes).step_by(8192) {
+                    stdout
+                        .write_all(&stdout_chunk[..(stdout_bytes - chunk).min(8192)])
+                        .unwrap();
+                }
+                stdout.flush().unwrap();
+                for chunk in (0..stderr_bytes).step_by(8192) {
+                    stderr
+                        .write_all(&stderr_chunk[..(stderr_bytes - chunk).min(8192)])
+                        .unwrap();
+                }
+                stderr.flush().unwrap();
+                if mode == "emit_wait" {
+                    fs::write(&output, b"ready").unwrap();
+                    let release = output.with_extension("release");
+                    while !release.exists() {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }
             }
             "wait" => {
                 fs::write(&output, b"ready").unwrap();
@@ -662,5 +770,200 @@ mod tests {
                 .code(),
             Some(0)
         );
+    }
+
+    fn emitting_spec(mode: &str, output: &Path, stdout: usize, stderr: usize) -> JobSpec {
+        let mut env = fixture_env(mode, output);
+        env.insert("MAESTRO_EXECUTOR_STDOUT_BYTES".into(), stdout.to_string());
+        env.insert("MAESTRO_EXECUTOR_STDERR_BYTES".into(), stderr.to_string());
+        JobSpec::new(executable(), fixture_args(&[]), Some(env), None).unwrap()
+    }
+
+    async fn poll_wait_once(child: &mut RunningProcess) {
+        use std::{future::Future, task::Poll};
+        let mut wait = Box::pin(child.wait());
+        std::future::poll_fn(|context| {
+            assert!(
+                wait.as_mut().poll(context).is_pending(),
+                "fixture should still be waiting"
+            );
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    async fn drive_until_output_ready(child: &mut RunningProcess, ready: &Path) {
+        tokio::time::timeout(WATCHDOG, async {
+            loop {
+                poll_wait_once(child).await;
+                if ready.exists()
+                    && !child.stdout().bytes().is_empty()
+                    && !child.stderr().bytes().is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture should write and announce readiness");
+    }
+
+    #[tokio::test]
+    async fn drains_large_stdout_and_stderr_without_deadlock_and_keeps_only_each_prefix() {
+        let root = TestRoot::new();
+        let spec = emitting_spec(
+            "emit",
+            &root.0.join("unused"),
+            2 * 1024 * 1024,
+            2 * 1024 * 1024,
+        );
+        let mut child = Executor::new(&root.0).unwrap().spawn(&spec).unwrap();
+        let status = tokio::time::timeout(WATCHDOG, child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.code(), Some(0));
+        assert_eq!(child.stdout().bytes().len(), OUTPUT_LIMIT_BYTES);
+        assert_eq!(child.stderr().bytes(), vec![b'e'; OUTPUT_LIMIT_BYTES]);
+        assert!(child.stdout().bytes().ends_with(b"oooooooo"));
+        assert!(child.stdout().is_truncated());
+        assert!(child.stderr().is_truncated());
+        assert!(!child.stdout().drain_timed_out());
+        assert!(!child.stderr().drain_timed_out());
+        let saved = child.stdout().bytes().to_vec();
+        assert_eq!(child.wait().await.unwrap(), status);
+        assert_eq!(child.stdout().bytes(), saved);
+    }
+
+    #[tokio::test]
+    async fn overflow_of_one_stream_does_not_consume_the_other_streams_budget() {
+        let root = TestRoot::new();
+        for (stdout, stderr) in [(2 * 1024 * 1024, 128), (128, 2 * 1024 * 1024)] {
+            let spec = emitting_spec("emit", &root.0.join("unused"), stdout, stderr);
+            let mut child = Executor::new(&root.0).unwrap().spawn(&spec).unwrap();
+            assert!(
+                tokio::time::timeout(WATCHDOG, child.wait())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .success()
+            );
+            assert_eq!(child.stdout().is_truncated(), stdout > OUTPUT_LIMIT_BYTES);
+            assert_eq!(child.stderr().is_truncated(), stderr > OUTPUT_LIMIT_BYTES);
+            assert!(
+                child
+                    .stdout()
+                    .bytes()
+                    .ends_with(&vec![b'o'; stdout.min(128)])
+            );
+            assert_eq!(
+                child.stderr().bytes(),
+                vec![b'e'; stderr.min(OUTPUT_LIMIT_BYTES)]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_wait_retains_both_prefixes_and_resumes_draining() {
+        let root = TestRoot::new();
+        let ready = root.0.join("capture-ready");
+        let spec = emitting_spec("emit_wait", &ready, 4096, 4096);
+        let mut child = Executor::new(&root.0).unwrap().spawn(&spec).unwrap();
+        drive_until_output_ready(&mut child, &ready).await;
+        let stdout_prefix = child.stdout().bytes().to_vec();
+        let stderr_prefix = child.stderr().bytes().to_vec();
+        fs::write(ready.with_extension("release"), b"finish").unwrap();
+        assert_eq!(
+            tokio::time::timeout(WATCHDOG, child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .code(),
+            Some(0)
+        );
+        assert!(child.stdout().bytes().starts_with(&stdout_prefix));
+        assert!(child.stderr().bytes().starts_with(&stderr_prefix));
+        assert_eq!(child.stderr().bytes(), vec![b'e'; 4096]);
+        assert!(!child.stdout().is_truncated());
+        assert!(!child.stderr().is_truncated());
+    }
+
+    #[tokio::test]
+    async fn termination_reaps_child_and_finishes_capture_after_cancelled_wait() {
+        let root = TestRoot::new();
+        let ready = root.0.join("capture-ready");
+        let spec = emitting_spec("emit_wait", &ready, 4096, 4096);
+        let mut child = Executor::new(&root.0).unwrap().spawn(&spec).unwrap();
+        drive_until_output_ready(&mut child, &ready).await;
+        let stdout_prefix = child.stdout().bytes().to_vec();
+        assert!(
+            !tokio::time::timeout(WATCHDOG, child.terminate_and_wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(child.id(), None);
+        assert!(child.stdout().bytes().starts_with(&stdout_prefix));
+        assert_eq!(child.stderr().bytes(), vec![b'e'; 4096]);
+        assert!(!child.stdout().drain_timed_out());
+        assert!(!child.stderr().drain_timed_out());
+    }
+
+    #[tokio::test]
+    async fn held_open_pipes_obey_post_exit_deadline_without_resetting_on_resume() {
+        let root = TestRoot::new();
+        for hold_stderr in [false, true] {
+            let ready = root.0.join(format!("pipe-holder-{hold_stderr}"));
+            let mut child = Executor::new(&root.0)
+                .unwrap()
+                .spawn(&emitting_spec("emit", &root.0.join("unused"), 0, 0))
+                .unwrap();
+            // Reap the quiet short-lived child. Replace its readers with pipes
+            // held by a separately owned process: the same inherited-FD condition,
+            // without creating real orphans or leaving descendants unreaped.
+            let status = child.child.wait().await.unwrap();
+            let mut holder = tokio::process::Command::new(executable());
+            holder
+                .args(fixture_args(&[]))
+                .envs(fixture_env("wait", &ready))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(if hold_stderr {
+                    Stdio::piped()
+                } else {
+                    Stdio::null()
+                })
+                .kill_on_drop(true);
+            let mut holder = holder.spawn().unwrap();
+            wait_for_file(&ready).await;
+            child.stdout = BoundedCapture::new(holder.stdout.take());
+            if hold_stderr {
+                child.stderr = BoundedCapture::new(holder.stderr.take());
+            }
+            poll_wait_once(&mut child).await;
+            let original_deadline = child
+                .output_deadline
+                .expect("child exit should start the drain deadline");
+            let result = tokio::time::timeout(WATCHDOG, child.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            fs::write(ready.with_extension("release"), b"finish").unwrap();
+            assert!(
+                tokio::time::timeout(WATCHDOG, holder.wait())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .success()
+            );
+            assert_eq!(result, status);
+            assert_eq!(child.output_deadline, Some(original_deadline));
+            assert!(child.stdout().is_truncated());
+            assert!(child.stdout().drain_timed_out());
+            assert_eq!(child.stderr().is_truncated(), hold_stderr);
+            assert_eq!(child.stderr().drain_timed_out(), hold_stderr);
+        }
     }
 }
