@@ -202,6 +202,12 @@ impl RunningProcess {
         self.child.id()
     }
 
+    /// Observe/reap an already-finished child without blocking or draining pipes.
+    /// Call wait afterwards to finish bounded output capture.
+    pub(crate) fn try_wait(&mut self) -> Result<Option<ExitStatus>, ExecutorError> {
+        self.child.try_wait().map_err(ExecutorError::Wait)
+    }
+
     pub(crate) fn stdout(&self) -> &CapturedOutput {
         self.stdout.output()
     }
@@ -966,4 +972,32 @@ mod tests {
             assert_eq!(child.stderr().drain_timed_out(), hold_stderr);
         }
     }
+    #[tokio::test]
+    async fn try_wait_is_nonblocking_and_preserves_exit_and_output() {
+        let root = TestRoot::new();
+        let ready = root.0.join("ready");
+        let mut child = Executor::new(&root.0)
+            .unwrap()
+            .spawn(&spec("wait", &ready, &[], None))
+            .unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        wait_for_file(&ready).await;
+        fs::write(ready.with_extension("release"), "release").unwrap();
+        let status = tokio::time::timeout(WATCHDOG, async {
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(status.code(), Some(0));
+        assert_eq!(child.wait().await.unwrap(), status);
+        assert_eq!(child.try_wait().unwrap(), Some(status));
+    }
 }
+
+#[cfg(test)]
+pub(crate) mod test_support;

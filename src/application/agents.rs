@@ -60,6 +60,16 @@ impl AgentsService {
         Ok(AgentSnapshot::from(&agent))
     }
 
+    pub(crate) fn poll_stop(
+        &self,
+        agent_id: AgentId,
+        allocation_id: AllocationId,
+    ) -> Result<Option<crate::state::store::StopCommand>, AppError> {
+        self.store
+            .poll_stop(agent_id, allocation_id)
+            .map_err(map_store_error)
+    }
+
     pub(crate) fn poll_assignment(
         &self,
         agent_id: AgentId,

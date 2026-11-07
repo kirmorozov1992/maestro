@@ -345,6 +345,23 @@ impl From<&AgentSnapshot> for AgentResponse {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StopCommandResponse {
+    pub(crate) job_id: JobId,
+    pub(crate) allocation_id: AllocationId,
+    pub(crate) agent_id: AgentId,
+}
+impl From<crate::state::store::StopCommand> for StopCommandResponse {
+    fn from(command: crate::state::store::StopCommand) -> Self {
+        Self {
+            job_id: command.job_id,
+            allocation_id: command.allocation_id,
+            agent_id: command.agent_id,
+        }
+    }
+}
+
 /// Sensitive execution data is transported only to the assigned worker.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]

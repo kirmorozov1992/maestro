@@ -13,6 +13,7 @@ use crate::{
 use std::{
     future::{Future, pending},
     process::ExitStatus,
+    time::Duration,
 };
 use tokio::time::Instant;
 
@@ -72,6 +73,7 @@ struct ActiveAssignment {
     process: Option<RunningProcess>,
     started_accepted: bool,
     terminal_attempted: bool,
+    stop_reason: Option<StopReasonV1>,
 }
 impl ActiveAssignment {
     fn started(&self) -> AllocationEventRequest {
@@ -87,6 +89,14 @@ impl ActiveAssignment {
             agent_id: self.agent_id,
             occurred_at: self.clock.now(),
             result,
+        }
+    }
+    fn stopped(&self, reason: StopReasonV1) -> AllocationEventRequest {
+        AllocationEventRequest::Stopped {
+            job_id: self.job_id,
+            agent_id: self.agent_id,
+            occurred_at: self.clock.now(),
+            reason,
         }
     }
     async fn cleanup(&mut self) -> Result<(), ExecutorError> {
@@ -134,12 +144,14 @@ impl ActiveAssignment {
 pub(super) struct LifecycleRunner {
     executor: Executor,
     active: Option<ActiveAssignment>,
+    poll_interval: Duration,
 }
 impl LifecycleRunner {
-    pub(super) fn new(executor: Executor) -> Self {
+    pub(super) fn new(executor: Executor, poll_interval: Duration) -> Self {
         Self {
             executor,
             active: None,
+            poll_interval,
         }
     }
 }
@@ -148,6 +160,64 @@ fn process_result(status: ExitStatus) -> ProcessResultV1 {
     match status.code() {
         Some(exit_code) => ProcessResultV1::Exited { exit_code },
         None => ProcessResultV1::ExecutionFailed,
+    }
+}
+
+enum WaitOutcome {
+    Completed(Result<ExitStatus, ExecutorError>),
+    StopRequested,
+}
+
+async fn wait_for_stop(
+    client: &AgentHttpClient,
+    job_id: JobId,
+    allocation_id: AllocationId,
+    agent_id: AgentId,
+    interval: Duration,
+) {
+    loop {
+        tokio::time::sleep(interval).await;
+        match client.poll_stop(agent_id, allocation_id).await {
+            Ok(Some(command))
+                if command.job_id == job_id
+                    && command.allocation_id == allocation_id
+                    && command.agent_id == agent_id =>
+            {
+                return;
+            }
+            Ok(Some(_)) => {
+                tracing::warn!(event="agent_stop_command_rejected", %job_id, %allocation_id, %agent_id)
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(event="agent_stop_poll_failed", %job_id, %allocation_id, %agent_id, error=?error)
+            }
+        }
+    }
+}
+
+async fn wait_or_stop(
+    process: &mut RunningProcess,
+    client: &AgentHttpClient,
+    job_id: JobId,
+    allocation_id: AllocationId,
+    agent_id: AgentId,
+    interval: Duration,
+) -> WaitOutcome {
+    let completed = tokio::select! {
+        biased;
+        outcome = process.wait() => Some(outcome),
+        () = wait_for_stop(client, job_id, allocation_id, agent_id, interval) => None,
+    };
+    if let Some(outcome) = completed {
+        return WaitOutcome::Completed(outcome);
+    }
+    // wait may still be draining inherited pipes after the child exited.
+    // Preserve that actual outcome instead of relabelling it as a user stop.
+    match process.try_wait() {
+        Ok(Some(_)) => WaitOutcome::Completed(process.wait().await),
+        Ok(None) => WaitOutcome::StopRequested,
+        Err(error) => WaitOutcome::Completed(Err(error)),
     }
 }
 
@@ -184,13 +254,14 @@ impl AssignmentHandler for LifecycleRunner {
             process: None,
             started_accepted: false,
             terminal_attempted: false,
+            stop_reason: None,
         });
         // This reference borrows persistent state; cancelling the future drops
         // the borrow, not the active process/report guards.
         let Some(active) = self.active.as_mut() else {
             return pending().await;
         };
-        let result = match self.executor.spawn(&spec) {
+        let terminal = match self.executor.spawn(&spec) {
             Ok(process) => {
                 active.process = Some(process);
                 if !active.report(client, active.started()).await {
@@ -201,7 +272,15 @@ impl AssignmentHandler for LifecycleRunner {
                 let Some(process) = active.process.as_mut() else {
                     return pending().await;
                 };
-                let outcome = process.wait().await;
+                let outcome = wait_or_stop(
+                    process,
+                    client,
+                    active.job_id,
+                    active.allocation_id,
+                    active.agent_id,
+                    self.poll_interval,
+                )
+                .await;
                 tracing::debug!(event="agent_process_output_summary", job_id=%active.job_id,
                     allocation_id=%active.allocation_id, agent_id=%active.agent_id,
                     stdout_bytes=process.stdout().bytes().len(), stdout_truncated=process.stdout().is_truncated(),
@@ -209,23 +288,30 @@ impl AssignmentHandler for LifecycleRunner {
                     stderr_bytes=process.stderr().bytes().len(), stderr_truncated=process.stderr().is_truncated(),
                     stderr_drain_timed_out=process.stderr().drain_timed_out());
                 match outcome {
-                    Ok(status) => process_result(status),
-                    Err(error) => {
+                    WaitOutcome::StopRequested => {
+                        // Persistent before the first kill/reap await; shutdown
+                        // must retain the user's reason if this future is dropped.
+                        active.stop_reason = Some(StopReasonV1::UserRequested);
+                        active.cleanup().await?;
+                        active.stopped(StopReasonV1::UserRequested)
+                    }
+                    WaitOutcome::Completed(Ok(status)) => active.finished(process_result(status)),
+                    WaitOutcome::Completed(Err(error)) => {
                         tracing::warn!(event="agent_process_wait_failed", job_id=%active.job_id,
                             allocation_id=%active.allocation_id, agent_id=%active.agent_id, code=error.code());
                         active.cleanup().await?;
-                        ProcessResultV1::ExecutionFailed
+                        active.finished(ProcessResultV1::ExecutionFailed)
                     }
                 }
             }
             Err(error) => {
                 tracing::warn!(event="agent_process_spawn_failed", job_id=%active.job_id,
                     allocation_id=%active.allocation_id, agent_id=%active.agent_id, code=error.code());
-                ProcessResultV1::SpawnFailed
+                active.finished(ProcessResultV1::SpawnFailed)
             }
         };
         active.terminal_attempted = true;
-        if !active.report(client, active.finished(result)).await {
+        if !active.report(client, terminal).await {
             return pending().await;
         }
         self.active = None;
@@ -237,12 +323,8 @@ impl AssignmentHandler for LifecycleRunner {
             active.cleanup().await?;
             if active.started_accepted && !active.terminal_attempted {
                 active.terminal_attempted = true;
-                let event = AllocationEventRequest::Stopped {
-                    job_id: active.job_id,
-                    agent_id: active.agent_id,
-                    occurred_at: active.clock.now(),
-                    reason: StopReasonV1::AgentShutdown,
-                };
+                let event =
+                    active.stopped(active.stop_reason.unwrap_or(StopReasonV1::AgentShutdown));
                 // Shutdown cannot retry or claim successful network delivery.
                 active.report(client, event).await;
             }

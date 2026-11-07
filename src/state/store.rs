@@ -25,6 +25,7 @@ struct StoreState {
     pending_jobs: VecDeque<JobId>,
     agent_allocations: HashMap<AgentId, AllocationId>,
     assignment_queue: HashMap<AgentId, VecDeque<QueuedAssignment>>,
+    stop_requests: HashMap<AllocationId, StopCommand>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +33,13 @@ pub(crate) struct QueuedAssignment {
     job_id: JobId,
     agent_id: AgentId,
     allocation_id: AllocationId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StopCommand {
+    pub(crate) job_id: JobId,
+    pub(crate) allocation_id: AllocationId,
+    pub(crate) agent_id: AgentId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +66,84 @@ impl QueuedAssignment {
 impl StateStore {
     fn lock(&self) -> Result<MutexGuard<'_, StoreState>, StateStoreError> {
         self.inner.lock().map_err(|_| StateStoreError::LockPoisoned)
+    }
+
+    /// Revalidate a previously read target under the same lock as enqueue.
+    pub(crate) fn request_stop(
+        &self,
+        job_id: JobId,
+        allocation_id: AllocationId,
+        agent_id: AgentId,
+    ) -> Result<(), StateStoreError> {
+        let mut state = self.lock()?;
+        let job = state
+            .jobs
+            .get(&job_id)
+            .ok_or_else(|| StateStoreError::not_found("job", job_id))?;
+        if !matches!(job.status(), JobStatus::Assigned | JobStatus::Running) {
+            return Err(StateStoreError::conflict(
+                "job",
+                job_id,
+                "job is no longer active",
+            ));
+        }
+        let allocation = state
+            .allocations
+            .get(&allocation_id)
+            .ok_or_else(|| StateStoreError::not_found("allocation", allocation_id))?;
+        if allocation.job_id() != job_id || allocation.agent_id() != agent_id {
+            return Err(StateStoreError::conflict(
+                "allocation",
+                allocation_id,
+                "stop target does not match allocation",
+            ));
+        }
+        validate_stop_target(&state, job, allocation)?;
+        state.stop_requests.insert(
+            allocation_id,
+            StopCommand {
+                job_id,
+                allocation_id,
+                agent_id,
+            },
+        );
+        Ok(())
+    }
+
+    /// Sticky read: only terminal lifecycle commit removes the command.
+    pub(crate) fn poll_stop(
+        &self,
+        agent_id: AgentId,
+        allocation_id: AllocationId,
+    ) -> Result<Option<StopCommand>, StateStoreError> {
+        let state = self.lock()?;
+        if !state.agents.contains_key(&agent_id) {
+            return Err(StateStoreError::not_found("agent", agent_id));
+        }
+        let allocation = state
+            .allocations
+            .get(&allocation_id)
+            .ok_or_else(|| StateStoreError::not_found("allocation", allocation_id))?;
+        if allocation.agent_id() != agent_id {
+            return Err(StateStoreError::conflict(
+                "allocation",
+                allocation_id,
+                "allocation belongs to another agent",
+            ));
+        }
+        // A terminal allocation may already have released its reservation and
+        // the same agent may own a different allocation now.
+        if is_terminal_allocation(allocation.status()) {
+            return Ok(None);
+        }
+        let job = state
+            .jobs
+            .get(&allocation.job_id())
+            .ok_or(StateStoreError::invariant(
+                "stop allocation references a missing job",
+            ))?;
+        validate_stop_target(&state, job, allocation)?;
+        Ok(state.stop_requests.get(&allocation_id).copied())
     }
 
     pub(crate) fn create_job(&self, job: Job) -> Result<(), StateStoreError> {
@@ -934,6 +1020,30 @@ impl StateStore {
     }
 }
 
+fn validate_stop_target(
+    state: &StoreState,
+    job: &Job,
+    allocation: &Allocation,
+) -> Result<(), StateStoreError> {
+    let consistent = matches!(
+        (job.status(), allocation.status()),
+        (JobStatus::Assigned, AllocationStatus::Assigned)
+            | (JobStatus::Running, AllocationStatus::Running)
+    );
+    if !consistent
+        || state.agent_allocations.get(&allocation.agent_id()) != Some(&allocation.id())
+        || !state
+            .agents
+            .get(&allocation.agent_id())
+            .is_some_and(|agent| agent.availability() == AgentAvailability::Busy)
+    {
+        return Err(StateStoreError::invariant(
+            "stop target does not match the active reservation",
+        ));
+    }
+    Ok(())
+}
+
 fn apply_events_in_state(
     state: &mut StoreState,
     events: &[JobEvent],
@@ -1045,6 +1155,9 @@ fn apply_events_in_state(
         let _ = state.pending_jobs.remove(index);
     }
     if let Some((agent_id, agent)) = updated_agent {
+        if let Some(allocation_id) = allocation_id {
+            state.stop_requests.remove(&allocation_id);
+        }
         state.agent_allocations.remove(&agent_id);
         state.agents.insert(agent_id, agent);
     }
@@ -2457,3 +2570,6 @@ mod tests {
         assert!(store.get_allocation(allocation_id(1)).is_err());
     }
 }
+
+#[cfg(test)]
+mod stop_tests;

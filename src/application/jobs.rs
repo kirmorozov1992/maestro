@@ -132,6 +132,9 @@ impl JobsService {
                     .get_allocation_for_job(id)
                     .map_err(map_store_error)?;
                 let request = stop_request_from_allocation(id, allocation)?;
+                self.store
+                    .request_stop(request.job_id, request.allocation_id, request.agent_id)
+                    .map_err(map_store_error)?;
                 Ok(StopOutcome::Requested(request))
             }
             JobStatus::Succeeded | JobStatus::Failed | JobStatus::Stopped | JobStatus::Lost => Err(
@@ -549,6 +552,12 @@ mod tests {
         assert_eq!(request.job_id, job_id);
         assert_eq!(request.allocation_id, allocation_id);
         assert_eq!(request.agent_id, assigned_agent_id);
+        let command = service
+            .store
+            .poll_stop(assigned_agent_id, allocation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(command.job_id, job_id);
         assert_eq!(service.store.get_job(job_id).unwrap(), before_job);
         assert_eq!(
             service.store.get_allocation(allocation_id).unwrap(),
@@ -572,6 +581,12 @@ mod tests {
         assert_eq!(request.job_id, job_id);
         assert_eq!(request.allocation_id, allocation_id);
         assert_eq!(request.agent_id, assigned_agent_id);
+        let command = service
+            .store
+            .poll_stop(assigned_agent_id, allocation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(command.job_id, job_id);
         assert_eq!(service.store.get_job(job_id).unwrap(), before_job);
         assert_eq!(
             service.store.get_allocation(allocation_id).unwrap(),

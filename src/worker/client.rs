@@ -2,7 +2,7 @@ use crate::{
     domain::{AgentId, AllocationId},
     transport::v1::{
         AgentResponse, AllocationEventRequest, AssignmentResponse, ErrorResponse,
-        EventReportResponse, RegisterAgentRequest,
+        EventReportResponse, RegisterAgentRequest, StopCommandResponse,
     },
 };
 use serde::de::DeserializeOwned;
@@ -126,6 +126,27 @@ impl AgentHttpClient {
             .await
             .map_err(|error| AgentClientError::Transport(error.without_url()))?;
 
+        match response.status() {
+            reqwest::StatusCode::NO_CONTENT => Ok(None),
+            reqwest::StatusCode::OK => Self::decode_json(response).await.map(Some),
+            status if status.is_success() => Err(AgentClientError::UnexpectedStatus { status }),
+            _ => Err(Self::decode_server_error(response).await),
+        }
+    }
+
+    pub(crate) async fn poll_stop(
+        &self,
+        agent_id: AgentId,
+        allocation_id: AllocationId,
+    ) -> Result<Option<StopCommandResponse>, AgentClientError> {
+        let response = self
+            .client
+            .get(self.url(&format!(
+                "/v1/agents/{agent_id}/allocations/{allocation_id}/stop"
+            )))
+            .send()
+            .await
+            .map_err(|error| AgentClientError::Transport(error.without_url()))?;
         match response.status() {
             reqwest::StatusCode::NO_CONTENT => Ok(None),
             reqwest::StatusCode::OK => Self::decode_json(response).await.map(Some),

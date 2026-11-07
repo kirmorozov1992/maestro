@@ -9,7 +9,7 @@ use crate::{
     transport::v1::{
         AgentResponse, AllocationEventRequest, AssignmentResponse, CreateJobRequest, ErrorResponse,
         EventReportResponse, HealthResponse, JobListResponse, JobResponse, RegisterAgentRequest,
-        StopJobResponse,
+        StopCommandResponse, StopJobResponse,
     },
 };
 use axum::{
@@ -156,6 +156,10 @@ fn router(state: Arc<ServerState>) -> Router {
         .route(
             "/v1/agents/{agent_id}/assignments/next",
             get(next_assignment),
+        )
+        .route(
+            "/v1/agents/{agent_id}/allocations/{allocation_id}/stop",
+            get(poll_stop),
         )
         .route(
             "/v1/allocations/{allocation_id}/events",
@@ -318,6 +322,31 @@ async fn next_assignment(
             Json(AssignmentResponse::new(&assignment, now)),
         )
             .into_response(),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => app_error_response(error),
+    }
+}
+
+async fn poll_stop(
+    State(state): State<Arc<ServerState>>,
+    path: Result<Path<(String, String)>, PathRejection>,
+) -> Response {
+    let Path((agent, allocation)) = match path {
+        Ok(path) => path,
+        Err(_) => return invalid_agent_id_response(),
+    };
+    let agent = match agent.parse::<AgentId>() {
+        Ok(id) => id,
+        Err(_) => return invalid_agent_id_response(),
+    };
+    let allocation = match allocation.parse::<AllocationId>() {
+        Ok(id) => id,
+        Err(_) => return invalid_allocation_id_response(),
+    };
+    match state.agents.poll_stop(agent, allocation) {
+        Ok(Some(command)) => {
+            (StatusCode::OK, Json(StopCommandResponse::from(command))).into_response()
+        }
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => app_error_response(error),
     }
@@ -518,6 +547,7 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    mod stop_tests;
     use crate::{
         config::ServerConfig,
         domain::{

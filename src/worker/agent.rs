@@ -123,7 +123,8 @@ where
     Shutdown: Future<Output = ()> + Send,
 {
     let executor = Executor::new(&config.working_dir).map_err(AgentRuntimeError::Executor)?;
-    run_with_handler(config, shutdown, LifecycleRunner::new(executor)).await
+    let runner = LifecycleRunner::new(executor, config.poll_interval);
+    run_with_handler(config, shutdown, runner).await
 }
 
 async fn run_with_handler<Shutdown, Handle>(
