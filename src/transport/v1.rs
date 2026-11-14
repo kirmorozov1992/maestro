@@ -33,6 +33,17 @@ impl CreateJobRequest {
     }
 }
 
+impl From<&JobSpec> for CreateJobRequest {
+    fn from(spec: &JobSpec) -> Self {
+        Self {
+            command: spec.command().to_owned(),
+            args: spec.args().to_vec(),
+            env: spec.env().cloned(),
+            working_dir: spec.working_dir().map(str::to_owned),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RegisterAgentRequest {

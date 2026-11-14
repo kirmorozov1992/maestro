@@ -1,6 +1,6 @@
 mod application;
 mod config;
-// M7.2–M7.4 consume this client; keep the typed API available between roadmap tasks.
+// M7.3–M7.4 consume the remaining status/stop methods.
 #[allow(dead_code)]
 mod cli_client;
 pub mod domain;
@@ -13,7 +13,9 @@ mod transport;
 mod worker;
 
 use clap::{Args, Parser, Subcommand, error::ErrorKind};
-use std::{error::Error, fmt, net::SocketAddr, path::PathBuf, process::ExitCode};
+use std::{error::Error, fmt, io::Read, net::SocketAddr, path::PathBuf, process::ExitCode};
+
+const MAX_SPEC_FILE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "maestro", about = "A small job orchestrator")]
@@ -26,7 +28,7 @@ struct Cli {
 enum Command {
     Server(ServerOptions),
     Agent(AgentOptions),
-    Submit(ClientOptions),
+    Submit(SubmitOptions),
     Status(ClientOptions),
     Stop(ClientOptions),
 }
@@ -81,6 +83,24 @@ struct AgentOptions {
 struct ClientOptions {
     #[arg(long, help = config::HELP_SERVER_ADDR)]
     server_addr: Option<SocketAddr>,
+}
+
+#[derive(Debug, Args)]
+struct SubmitOptions {
+    #[command(flatten)]
+    client: ClientOptions,
+    #[arg(long, value_name = "FILE", conflicts_with = "command_and_args")]
+    spec: Option<PathBuf>,
+    #[arg(long, help = "Print the created job ID as JSON")]
+    json: bool,
+    #[arg(
+        value_name = "COMMAND",
+        required_unless_present = "spec",
+        num_args = 1..,
+        conflicts_with = "spec",
+        trailing_var_arg = true
+    )]
+    command_and_args: Vec<String>,
 }
 
 fn main() -> ExitCode {
@@ -147,7 +167,8 @@ fn launch(command: Command, environment: &config::Environment) -> Result<(), Lau
             )?)?;
         }
         Command::Submit(options) => {
-            launch_mode("submit", config::client(options.server_addr, environment)?);
+            let client_config = config::client(options.client.server_addr, environment)?;
+            run_submit(options, client_config)?;
         }
         Command::Status(options) => {
             launch_mode("status", config::client(options.server_addr, environment)?);
@@ -159,12 +180,144 @@ fn launch(command: Command, environment: &config::Environment) -> Result<(), Lau
     Ok(())
 }
 
+fn run_submit(
+    options: SubmitOptions,
+    client_config: config::ClientConfig,
+) -> Result<(), LaunchError> {
+    let SubmitOptions {
+        spec,
+        json,
+        command_and_args,
+        ..
+    } = options;
+    let request = submit_request(spec, command_and_args)?;
+    let client = cli_client::CliHttpClient::new(client_config.server_addr)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(SubmitError::RuntimeBuild)?;
+    let response = runtime.block_on(client.create_job(&request))?;
+    let job_id = response.job.id;
+
+    if json {
+        println!("{}", serde_json::json!({ "job_id": job_id }));
+    } else {
+        println!("job_id: {job_id}");
+    }
+
+    Ok(())
+}
+
+fn submit_request(
+    spec_file: Option<PathBuf>,
+    command_and_args: Vec<String>,
+) -> Result<transport::v1::CreateJobRequest, SubmitError> {
+    let spec = match spec_file {
+        Some(path) => {
+            if !command_and_args.is_empty() {
+                return Err(SubmitError::ConflictingInput);
+            }
+            let metadata = std::fs::metadata(&path).map_err(SubmitError::SpecFileRead)?;
+            if !metadata.is_file() {
+                return Err(SubmitError::SpecFileNotRegular);
+            }
+            if metadata.len() > MAX_SPEC_FILE_BYTES {
+                return Err(SubmitError::SpecFileTooLarge);
+            }
+            let file = std::fs::File::open(path).map_err(SubmitError::SpecFileRead)?;
+            let mut contents = Vec::new();
+            file.take(MAX_SPEC_FILE_BYTES + 1)
+                .read_to_end(&mut contents)
+                .map_err(SubmitError::SpecFileRead)?;
+            if contents.len() as u64 > MAX_SPEC_FILE_BYTES {
+                return Err(SubmitError::SpecFileTooLarge);
+            }
+            serde_json::from_slice(&contents).map_err(SubmitError::SpecFileParse)?
+        }
+        None => {
+            let mut values = command_and_args.into_iter();
+            let command = values.next().ok_or(SubmitError::MissingInput)?;
+            let args = values.collect();
+            domain::JobSpec::new(command, args, None, None).map_err(SubmitError::InvalidJobSpec)?
+        }
+    };
+
+    Ok(transport::v1::CreateJobRequest::from(&spec))
+}
+
 #[derive(Debug)]
 enum LaunchError {
     Agent(worker::agent::AgentRuntimeError),
     CliClient(cli_client::CliClientError),
     Configuration(config::ConfigError),
     Server(server::ServerError),
+    Submit(SubmitError),
+}
+
+enum SubmitError {
+    ConflictingInput,
+    InvalidJobSpec(domain::JobSpecError),
+    MissingInput,
+    RuntimeBuild(std::io::Error),
+    SpecFileParse(serde_json::Error),
+    SpecFileRead(std::io::Error),
+    SpecFileNotRegular,
+    SpecFileTooLarge,
+}
+
+impl fmt::Debug for SubmitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ConflictingInput => formatter.write_str("SubmitError::ConflictingInput"),
+            Self::InvalidJobSpec(error) => formatter
+                .debug_tuple("SubmitError::InvalidJobSpec")
+                .field(&error.code())
+                .finish(),
+            Self::MissingInput => formatter.write_str("SubmitError::MissingInput"),
+            Self::RuntimeBuild(_) => formatter.write_str("SubmitError::RuntimeBuild"),
+            Self::SpecFileParse(_) => formatter.write_str("SubmitError::SpecFileParse"),
+            Self::SpecFileRead(_) => formatter.write_str("SubmitError::SpecFileRead"),
+            Self::SpecFileNotRegular => formatter.write_str("SubmitError::SpecFileNotRegular"),
+            Self::SpecFileTooLarge => formatter.write_str("SubmitError::SpecFileTooLarge"),
+        }
+    }
+}
+
+impl fmt::Display for SubmitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ConflictingInput => {
+                formatter.write_str("provide either --spec or a command with arguments")
+            }
+            Self::InvalidJobSpec(error) => {
+                write!(formatter, "invalid job specification: {error}")
+            }
+            Self::MissingInput => formatter.write_str("provide a command or --spec FILE"),
+            Self::RuntimeBuild(_) => formatter.write_str("could not initialize CLI runtime"),
+            Self::SpecFileParse(_) => formatter.write_str("job specification file is invalid"),
+            Self::SpecFileRead(_) => formatter.write_str("could not read job specification file"),
+            Self::SpecFileNotRegular => {
+                formatter.write_str("job specification must be a regular file")
+            }
+            Self::SpecFileTooLarge => {
+                formatter.write_str("job specification file exceeds the 1 MiB limit")
+            }
+        }
+    }
+}
+
+impl Error for SubmitError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidJobSpec(source) => Some(source),
+            Self::RuntimeBuild(source) | Self::SpecFileRead(source) => Some(source),
+            Self::SpecFileParse(source) => Some(source),
+            Self::ConflictingInput
+            | Self::MissingInput
+            | Self::SpecFileNotRegular
+            | Self::SpecFileTooLarge => None,
+        }
+    }
 }
 
 impl From<worker::agent::AgentRuntimeError> for LaunchError {
@@ -176,6 +329,12 @@ impl From<worker::agent::AgentRuntimeError> for LaunchError {
 impl From<cli_client::CliClientError> for LaunchError {
     fn from(error: cli_client::CliClientError) -> Self {
         Self::CliClient(error)
+    }
+}
+
+impl From<SubmitError> for LaunchError {
+    fn from(error: SubmitError) -> Self {
+        Self::Submit(error)
     }
 }
 
@@ -198,6 +357,7 @@ impl fmt::Display for LaunchError {
             Self::CliClient(error) => error.fmt(formatter),
             Self::Configuration(error) => error.fmt(formatter),
             Self::Server(error) => error.fmt(formatter),
+            Self::Submit(error) => error.fmt(formatter),
         }
     }
 }
@@ -209,6 +369,7 @@ impl Error for LaunchError {
             Self::CliClient(error) => Some(error),
             Self::Configuration(error) => Some(error),
             Self::Server(error) => Some(error),
+            Self::Submit(error) => Some(error),
         }
     }
 }
