@@ -1,8 +1,6 @@
 mod application;
-mod config;
-// M7.4 consumes the remaining stop method.
-#[allow(dead_code)]
 mod cli_client;
+mod config;
 pub mod domain;
 pub mod error;
 mod scheduler;
@@ -30,7 +28,7 @@ enum Command {
     Agent(AgentOptions),
     Submit(SubmitOptions),
     Status(StatusOptions),
-    Stop(ClientOptions),
+    Stop(StopOptions),
 }
 
 #[derive(Debug, Args)]
@@ -93,6 +91,16 @@ struct StatusOptions {
     json: bool,
     #[arg(value_name = "JOB_ID")]
     job_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct StopOptions {
+    #[command(flatten)]
+    client: ClientOptions,
+    #[arg(long, help = "Print the stop response as JSON")]
+    json: bool,
+    #[arg(value_name = "JOB_ID")]
+    job_id: String,
 }
 
 #[derive(Debug, Args)]
@@ -185,7 +193,8 @@ fn launch(command: Command, environment: &config::Environment) -> Result<(), Lau
             run_status(options, client_config)?;
         }
         Command::Stop(options) => {
-            launch_mode("stop", config::client(options.server_addr, environment)?);
+            let client_config = config::client(options.client.server_addr, environment)?;
+            run_stop(options, client_config)?;
         }
     }
     Ok(())
@@ -255,6 +264,49 @@ fn run_status(
     }
 
     Ok(())
+}
+
+fn run_stop(options: StopOptions, client_config: config::ClientConfig) -> Result<(), LaunchError> {
+    let job_id = options
+        .job_id
+        .parse::<domain::JobId>()
+        .map_err(|_| StopError::InvalidJobId)?;
+    let client = cli_client::CliHttpClient::new(client_config.server_addr)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(StopError::RuntimeBuild)?;
+    let response = runtime.block_on(client.stop_job(job_id))?;
+
+    if options.json {
+        let output = serde_json::to_string(&response).map_err(StopError::Json)?;
+        println!("{output}");
+    } else {
+        print_stop_response(&response);
+    }
+
+    Ok(())
+}
+
+fn print_stop_response(response: &transport::v1::StopJobResponse) {
+    match response {
+        transport::v1::StopJobResponse::Completed { job } => {
+            println!("stop: completed");
+            println!("job_id: {}", job.job.id);
+            println!("status: {}", job_status_label(job.job.status));
+        }
+        transport::v1::StopJobResponse::Requested {
+            job_id,
+            allocation_id,
+            agent_id,
+        } => {
+            println!("stop: requested");
+            println!("job_id: {job_id}");
+            println!("allocation_id: {allocation_id}");
+            println!("agent_id: {agent_id}");
+            println!("job_status: not included; run `maestro status {job_id}` to check");
+        }
+    }
 }
 
 fn serialize_status_json(response: &impl serde::Serialize) -> Result<String, StatusError> {
@@ -379,7 +431,44 @@ enum LaunchError {
     Configuration(config::ConfigError),
     Server(server::ServerError),
     Status(StatusError),
+    Stop(StopError),
     Submit(SubmitError),
+}
+
+enum StopError {
+    InvalidJobId,
+    Json(serde_json::Error),
+    RuntimeBuild(std::io::Error),
+}
+
+impl fmt::Debug for StopError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidJobId => formatter.write_str("StopError::InvalidJobId"),
+            Self::Json(_) => formatter.write_str("StopError::Json"),
+            Self::RuntimeBuild(_) => formatter.write_str("StopError::RuntimeBuild"),
+        }
+    }
+}
+
+impl fmt::Display for StopError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidJobId => formatter.write_str("job ID must be a valid UUID"),
+            Self::Json(_) => formatter.write_str("could not serialize stop response"),
+            Self::RuntimeBuild(_) => formatter.write_str("could not initialize CLI runtime"),
+        }
+    }
+}
+
+impl Error for StopError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Json(source) => Some(source),
+            Self::RuntimeBuild(source) => Some(source),
+            Self::InvalidJobId => None,
+        }
+    }
 }
 
 enum StatusError {
@@ -508,6 +597,12 @@ impl From<StatusError> for LaunchError {
     }
 }
 
+impl From<StopError> for LaunchError {
+    fn from(error: StopError) -> Self {
+        Self::Stop(error)
+    }
+}
+
 impl From<config::ConfigError> for LaunchError {
     fn from(error: config::ConfigError) -> Self {
         Self::Configuration(error)
@@ -528,6 +623,7 @@ impl fmt::Display for LaunchError {
             Self::Configuration(error) => error.fmt(formatter),
             Self::Server(error) => error.fmt(formatter),
             Self::Status(error) => error.fmt(formatter),
+            Self::Stop(error) => error.fmt(formatter),
             Self::Submit(error) => error.fmt(formatter),
         }
     }
@@ -541,13 +637,10 @@ impl Error for LaunchError {
             Self::Configuration(error) => Some(error),
             Self::Server(error) => Some(error),
             Self::Status(error) => Some(error),
+            Self::Stop(error) => Some(error),
             Self::Submit(error) => Some(error),
         }
     }
-}
-
-fn launch_mode(mode: &str, _configuration: impl std::fmt::Debug) {
-    println!("maestro {mode} mode is not implemented yet");
 }
 
 #[cfg(test)]

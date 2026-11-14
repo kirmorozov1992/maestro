@@ -11,6 +11,7 @@ use std::{
 
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{Path, State},
     http::StatusCode,
     routing::{get, post},
@@ -134,6 +135,94 @@ struct StatusMockServer {
     task: JoinHandle<()>,
 }
 
+#[derive(Clone)]
+struct StopMockState {
+    requests: Arc<Mutex<Vec<RecordedStopRequest>>>,
+    response_status: StatusCode,
+    response_body: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecordedStopRequest {
+    path: String,
+    body: Vec<u8>,
+}
+
+struct StopMockServer {
+    address: std::net::SocketAddr,
+    requests: Arc<Mutex<Vec<RecordedStopRequest>>>,
+    shutdown: oneshot::Sender<()>,
+    task: JoinHandle<()>,
+}
+
+impl StopMockServer {
+    async fn start(response_status: StatusCode, response_body: Value) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stop fixture should bind a loopback address");
+        let address = listener
+            .local_addr()
+            .expect("stop fixture address should be available");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = StopMockState {
+            requests: Arc::clone(&requests),
+            response_status,
+            response_body,
+        };
+        let app = Router::new()
+            .route("/v1/jobs/{job_id}/stop", post(stop_handler))
+            .with_state(state);
+        let (shutdown, shutdown_signal) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_signal.await;
+                })
+                .await
+                .expect("stop fixture should shut down cleanly");
+        });
+
+        Self {
+            address,
+            requests,
+            shutdown,
+            task,
+        }
+    }
+
+    fn requests(&self) -> Vec<RecordedStopRequest> {
+        self.requests
+            .lock()
+            .expect("stop request list should not be poisoned")
+            .clone()
+    }
+
+    async fn stop(self) {
+        self.shutdown
+            .send(())
+            .expect("stop fixture should still be running");
+        self.task
+            .await
+            .expect("stop fixture task should finish cleanly");
+    }
+}
+
+async fn stop_handler(
+    Path(job_id): Path<String>,
+    State(state): State<StopMockState>,
+    body: Bytes,
+) -> (StatusCode, Json<Value>) {
+    state
+        .requests
+        .lock()
+        .expect("stop request list should not be poisoned")
+        .push(RecordedStopRequest {
+            path: format!("/v1/jobs/{job_id}/stop"),
+            body: body.to_vec(),
+        });
+    (state.response_status, Json(state.response_body.clone()))
+}
+
 impl StatusMockServer {
     async fn start(response_status: StatusCode, response_body: Value) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -227,6 +316,22 @@ fn submitted_job_response() -> Value {
     })
 }
 
+fn stop_requested_response() -> Value {
+    json!({
+        "outcome": "requested",
+        "job_id": SUBMITTED_JOB_ID,
+        "allocation_id": "550e8400-e29b-41d4-a716-446655440002",
+        "agent_id": "550e8400-e29b-41d4-a716-446655440001"
+    })
+}
+
+fn stop_completed_response() -> Value {
+    json!({
+        "outcome": "completed",
+        "job": status_job_response(SUBMITTED_JOB_ID, "stopped", Some(150), None)
+    })
+}
+
 fn status_job_response(
     id: &str,
     status: &str,
@@ -279,15 +384,6 @@ fn help_lists_the_supported_commands() {
     for command in ["server", "agent", "submit", "status", "stop"] {
         assert!(stdout.contains(command), "help is missing {command}");
     }
-}
-
-#[test]
-fn stop_runs_as_placeholder() {
-    let output = run_cli(&["stop"]);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert!(output.status.success(), "stop returned an error");
-    assert!(stdout.contains("maestro stop mode is not implemented yet"));
 }
 
 #[test]
@@ -445,13 +541,32 @@ fn server_cli_values_override_invalid_environment_values() {
     assert!(stayed_running);
 }
 
-#[test]
-fn stop_accepts_server_address_configuration() {
-    assert!(
-        run_cli(&["stop", "--server-addr", "127.0.0.1:9002"])
-            .status
-            .success()
+#[tokio::test]
+async fn stop_accepts_server_address_configuration() {
+    let response = stop_requested_response();
+    let server = StopMockServer::start(StatusCode::ACCEPTED, response).await;
+    let address = server.address.to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        run_cli_owned(vec![
+            "stop".into(),
+            "--server-addr".into(),
+            address,
+            SUBMITTED_JOB_ID.into(),
+        ])
+    })
+    .await
+    .expect("CLI subprocess should finish");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        server.requests(),
+        vec![RecordedStopRequest {
+            path: format!("/v1/jobs/{SUBMITTED_JOB_ID}/stop"),
+            body: Vec::new(),
+        }]
     );
+
+    server.stop().await;
 }
 
 #[tokio::test]
@@ -875,6 +990,216 @@ async fn status_not_found_returns_nonzero_and_safe_stderr() {
     );
 
     server.stop().await;
+}
+
+#[tokio::test]
+async fn stop_requested_response_is_human_readable() {
+    let server = StopMockServer::start(StatusCode::ACCEPTED, stop_requested_response()).await;
+    let address = server.address.to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        run_cli_owned(vec![
+            "stop".into(),
+            "--server-addr".into(),
+            address,
+            SUBMITTED_JOB_ID.into(),
+        ])
+    })
+    .await
+    .expect("CLI subprocess should finish");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!(
+            "stop: requested\njob_id: {SUBMITTED_JOB_ID}\nallocation_id: 550e8400-e29b-41d4-a716-446655440002\nagent_id: 550e8400-e29b-41d4-a716-446655440001\njob_status: not included; run `maestro status {SUBMITTED_JOB_ID}` to check\n"
+        )
+    );
+    assert_eq!(
+        server.requests(),
+        vec![RecordedStopRequest {
+            path: format!("/v1/jobs/{SUBMITTED_JOB_ID}/stop"),
+            body: Vec::new(),
+        }]
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn stop_completed_response_shows_status() {
+    let server = StopMockServer::start(StatusCode::OK, stop_completed_response()).await;
+    let address = server.address.to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        run_cli_owned(vec![
+            "stop".into(),
+            "--server-addr".into(),
+            address,
+            SUBMITTED_JOB_ID.into(),
+        ])
+    })
+    .await
+    .expect("CLI subprocess should finish");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("stop: completed\njob_id: {SUBMITTED_JOB_ID}\nstatus: stopped\n")
+    );
+    assert_eq!(
+        server.requests(),
+        vec![RecordedStopRequest {
+            path: format!("/v1/jobs/{SUBMITTED_JOB_ID}/stop"),
+            body: Vec::new(),
+        }]
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn stop_requested_response_can_be_json() {
+    let response = stop_requested_response();
+    let server = StopMockServer::start(StatusCode::ACCEPTED, response.clone()).await;
+    let address = server.address.to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        run_cli_owned(vec![
+            "stop".into(),
+            "--server-addr".into(),
+            address,
+            SUBMITTED_JOB_ID.into(),
+            "--json".into(),
+        ])
+    })
+    .await
+    .expect("CLI subprocess should finish");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        response
+    );
+    assert_eq!(
+        server.requests(),
+        vec![RecordedStopRequest {
+            path: format!("/v1/jobs/{SUBMITTED_JOB_ID}/stop"),
+            body: Vec::new(),
+        }]
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn stop_completed_response_can_be_json() {
+    let response = stop_completed_response();
+    let server = StopMockServer::start(StatusCode::OK, response.clone()).await;
+    let address = server.address.to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        run_cli_owned(vec![
+            "stop".into(),
+            "--server-addr".into(),
+            address,
+            SUBMITTED_JOB_ID.into(),
+            "--json".into(),
+        ])
+    })
+    .await
+    .expect("CLI subprocess should finish");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        response
+    );
+    assert_eq!(
+        server.requests(),
+        vec![RecordedStopRequest {
+            path: format!("/v1/jobs/{SUBMITTED_JOB_ID}/stop"),
+            body: Vec::new(),
+        }]
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn stop_rejects_invalid_job_id_before_http() {
+    let server = StopMockServer::start(StatusCode::ACCEPTED, stop_requested_response()).await;
+    let address = server.address.to_string();
+    let invalid_id = "not-a-uuid-secret";
+    let output = tokio::task::spawn_blocking(move || {
+        run_cli_owned(vec![
+            "stop".into(),
+            "--server-addr".into(),
+            address,
+            invalid_id.into(),
+        ])
+    })
+    .await
+    .expect("CLI subprocess should finish");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(stderr.contains("job ID must be a valid UUID"));
+    assert!(!stderr.contains("not-a-uuid-secret"));
+    assert!(server.requests().is_empty());
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn stop_terminal_conflict_is_not_reported_as_success() {
+    let server = StopMockServer::start(
+        StatusCode::CONFLICT,
+        json!({
+            "code": "conflict",
+            "message": "job is already terminal",
+            "details": null
+        }),
+    )
+    .await;
+    let address = server.address.to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        run_cli_owned(vec![
+            "stop".into(),
+            "--server-addr".into(),
+            address,
+            SUBMITTED_JOB_ID.into(),
+        ])
+    })
+    .await
+    .expect("CLI subprocess should finish");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(stderr.contains("job is already terminal"));
+    assert!(stderr.contains("conflict"));
+    assert!(stderr.contains("409"));
+    assert!(!stderr.contains("http://"));
+    assert_eq!(
+        server.requests(),
+        vec![RecordedStopRequest {
+            path: format!("/v1/jobs/{SUBMITTED_JOB_ID}/stop"),
+            body: Vec::new(),
+        }]
+    );
+
+    server.stop().await;
+}
+
+#[test]
+fn stop_requires_a_job_id() {
+    let output = run_cli(&["stop"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr.contains("invalid command-line arguments"));
 }
 
 #[tokio::test]
