@@ -1,5 +1,8 @@
 mod application;
 mod config;
+// M7.2–M7.4 consume this client; keep the typed API available between roadmap tasks.
+#[allow(dead_code)]
+mod cli_client;
 pub mod domain;
 pub mod error;
 mod scheduler;
@@ -109,7 +112,11 @@ fn main() -> ExitCode {
     };
 
     let environment = config::Environment::from_process();
-    match launch(cli.command, &environment) {
+    launch_exit_code(launch(cli.command, &environment))
+}
+
+fn launch_exit_code(result: Result<(), LaunchError>) -> ExitCode {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
@@ -155,6 +162,7 @@ fn launch(command: Command, environment: &config::Environment) -> Result<(), Lau
 #[derive(Debug)]
 enum LaunchError {
     Agent(worker::agent::AgentRuntimeError),
+    CliClient(cli_client::CliClientError),
     Configuration(config::ConfigError),
     Server(server::ServerError),
 }
@@ -162,6 +170,12 @@ enum LaunchError {
 impl From<worker::agent::AgentRuntimeError> for LaunchError {
     fn from(error: worker::agent::AgentRuntimeError) -> Self {
         Self::Agent(error)
+    }
+}
+
+impl From<cli_client::CliClientError> for LaunchError {
+    fn from(error: cli_client::CliClientError) -> Self {
+        Self::CliClient(error)
     }
 }
 
@@ -181,6 +195,7 @@ impl fmt::Display for LaunchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Agent(error) => error.fmt(formatter),
+            Self::CliClient(error) => error.fmt(formatter),
             Self::Configuration(error) => error.fmt(formatter),
             Self::Server(error) => error.fmt(formatter),
         }
@@ -191,6 +206,7 @@ impl Error for LaunchError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Agent(error) => Some(error),
+            Self::CliClient(error) => Some(error),
             Self::Configuration(error) => Some(error),
             Self::Server(error) => Some(error),
         }
@@ -199,4 +215,21 @@ impl Error for LaunchError {
 
 fn launch_mode(mode: &str, _configuration: impl std::fmt::Debug) {
     println!("maestro {mode} mode is not implemented yet");
+}
+
+#[cfg(test)]
+mod cli_exit_tests {
+    use super::{LaunchError, launch_exit_code};
+    use crate::cli_client::CliClientError;
+
+    #[test]
+    fn api_client_error_returns_nonzero_process_exit_code() {
+        let error = LaunchError::CliClient(CliClientError::UnexpectedStatus {
+            status: reqwest::StatusCode::ACCEPTED,
+        });
+        assert_eq!(
+            launch_exit_code(Err(error)),
+            std::process::ExitCode::from(2)
+        );
+    }
 }

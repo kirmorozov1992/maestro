@@ -12,7 +12,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CreateJobRequest {
     pub(crate) command: String,
@@ -303,7 +303,7 @@ impl From<&AllocationSnapshot> for AllocationResponse {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct JobResponse {
     #[serde(flatten)]
     pub(crate) job: JobDataResponse,
@@ -319,7 +319,7 @@ impl JobResponse {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct JobListResponse {
     pub(crate) items: Vec<JobResponse>,
 }
@@ -411,7 +411,7 @@ impl AssignmentResponse {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub(crate) enum StopJobResponse {
     Completed {
