@@ -9,11 +9,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    routing::{get, post},
+};
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
 const SUBMITTED_JOB_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+const STATUS_JOB_ID: &str = "550e8400-e29b-41d4-a716-446655440010";
+const STATUS_PENDING_JOB_ID: &str = "550e8400-e29b-41d4-a716-446655440011";
 
 static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -113,6 +120,94 @@ async fn submit_handler(
     (state.response_status, Json(state.response_body))
 }
 
+#[derive(Clone)]
+struct StatusMockState {
+    requests: Arc<Mutex<Vec<String>>>,
+    response_status: StatusCode,
+    response_body: Value,
+}
+
+struct StatusMockServer {
+    address: std::net::SocketAddr,
+    requests: Arc<Mutex<Vec<String>>>,
+    shutdown: oneshot::Sender<()>,
+    task: JoinHandle<()>,
+}
+
+impl StatusMockServer {
+    async fn start(response_status: StatusCode, response_body: Value) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("status fixture should bind a loopback address");
+        let address = listener
+            .local_addr()
+            .expect("status fixture address should be available");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = StatusMockState {
+            requests: Arc::clone(&requests),
+            response_status,
+            response_body,
+        };
+        let app = Router::new()
+            .route("/v1/jobs", get(status_list_handler))
+            .route("/v1/jobs/{job_id}", get(status_job_handler))
+            .with_state(state);
+        let (shutdown, shutdown_signal) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_signal.await;
+                })
+                .await
+                .expect("status fixture should shut down cleanly");
+        });
+
+        Self {
+            address,
+            requests,
+            shutdown,
+            task,
+        }
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .expect("request list should not be poisoned")
+            .clone()
+    }
+
+    async fn stop(self) {
+        self.shutdown
+            .send(())
+            .expect("status fixture should still be running");
+        self.task
+            .await
+            .expect("status fixture task should finish cleanly");
+    }
+}
+
+async fn status_list_handler(State(state): State<StatusMockState>) -> (StatusCode, Json<Value>) {
+    state
+        .requests
+        .lock()
+        .expect("request list should not be poisoned")
+        .push("GET /v1/jobs".into());
+    (state.response_status, Json(state.response_body.clone()))
+}
+
+async fn status_job_handler(
+    Path(job_id): Path<String>,
+    State(state): State<StatusMockState>,
+) -> (StatusCode, Json<Value>) {
+    state
+        .requests
+        .lock()
+        .expect("request list should not be poisoned")
+        .push(format!("GET /v1/jobs/{job_id}"));
+    (state.response_status, Json(state.response_body.clone()))
+}
+
 fn submitted_job_response() -> Value {
     json!({
         "id": SUBMITTED_JOB_ID,
@@ -129,6 +224,43 @@ fn submitted_job_response() -> Value {
         "finished_at": null,
         "terminal_result": null,
         "allocation": null
+    })
+}
+
+fn status_job_response(
+    id: &str,
+    status: &str,
+    started_at: Option<u64>,
+    allocation: Option<Value>,
+) -> Value {
+    json!({
+        "id": id,
+        "spec": {
+            "command": "/bin/echo",
+            "args": ["private-argument"],
+            "env_keys": ["TOKEN"],
+            "working_dir": null
+        },
+        "status": status,
+        "submitted_at": 100,
+        "updated_at": 120,
+        "started_at": started_at,
+        "finished_at": null,
+        "terminal_result": null,
+        "allocation": allocation
+    })
+}
+
+fn status_allocation_response(job_id: &str, status: &str) -> Value {
+    json!({
+        "id": "550e8400-e29b-41d4-a716-446655440002",
+        "job_id": job_id,
+        "agent_id": "550e8400-e29b-41d4-a716-446655440001",
+        "status": status,
+        "attempt": 1,
+        "assigned_at": 110,
+        "started_at": 115,
+        "finished_at": null
     })
 }
 
@@ -150,14 +282,12 @@ fn help_lists_the_supported_commands() {
 }
 
 #[test]
-fn commands_run_as_placeholders() {
-    for command in ["status", "stop"] {
-        let output = run_cli(&[command]);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+fn stop_runs_as_placeholder() {
+    let output = run_cli(&["stop"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
 
-        assert!(output.status.success(), "{command} returned an error");
-        assert!(stdout.contains(&format!("maestro {command} mode is not implemented yet")));
-    }
+    assert!(output.status.success(), "stop returned an error");
+    assert!(stdout.contains("maestro stop mode is not implemented yet"));
 }
 
 #[test]
@@ -316,14 +446,12 @@ fn server_cli_values_override_invalid_environment_values() {
 }
 
 #[test]
-fn commands_accept_their_configuration_options() {
-    for command in ["status", "stop"] {
-        assert!(
-            run_cli(&[command, "--server-addr", "127.0.0.1:9002"])
-                .status
-                .success()
-        );
-    }
+fn stop_accepts_server_address_configuration() {
+    assert!(
+        run_cli(&["stop", "--server-addr", "127.0.0.1:9002"])
+            .status
+            .success()
+    );
 }
 
 #[tokio::test]
@@ -522,8 +650,235 @@ fn submit_rejects_spec_with_positional_command() {
     assert!(!stderr.contains(&path));
 }
 
+#[tokio::test]
+async fn status_list_prints_human_readable_jobs() {
+    let running_job = status_job_response(
+        STATUS_JOB_ID,
+        "running",
+        Some(115),
+        Some(status_allocation_response(STATUS_JOB_ID, "running")),
+    );
+    let pending_job = status_job_response(STATUS_PENDING_JOB_ID, "pending", None, None);
+    let response = json!({"items": [running_job, pending_job]});
+    let server = StatusMockServer::start(StatusCode::OK, response).await;
+    let address = server.address.to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        run_cli_owned(vec!["status".into(), "--server-addr".into(), address])
+    })
+    .await
+    .expect("CLI subprocess should finish");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert!(stdout.contains("jobs: 2"));
+    assert!(stdout.contains(&format!("job_id: {STATUS_JOB_ID}")));
+    assert!(stdout.contains(&format!("job_id: {STATUS_PENDING_JOB_ID}")));
+    assert!(stdout.contains("status: running"));
+    assert!(stdout.contains("status: pending"));
+    assert!(stdout.contains("submitted_at_ms: 100"));
+    assert!(stdout.contains("updated_at_ms: 120"));
+    assert!(stdout.contains("started_at_ms: 115"));
+    assert!(stdout.contains("allocation_id: 550e8400-e29b-41d4-a716-446655440002"));
+    assert!(stdout.contains("allocation_status: running"));
+    assert!(stdout.contains("agent_id: 550e8400-e29b-41d4-a716-446655440001"));
+    assert!(stdout.contains("assigned_at_ms: 110"));
+    assert!(stdout.contains("allocation_started_at_ms: 115"));
+    assert!(stdout.contains("allocation: none"));
+    assert!(!stdout.contains("private-argument"));
+    assert!(!stdout.contains("TOKEN"));
+    assert_eq!(server.requests(), vec!["GET /v1/jobs"]);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn status_single_job_prints_human_readable_fields() {
+    let response = status_job_response(
+        STATUS_JOB_ID,
+        "running",
+        Some(115),
+        Some(status_allocation_response(STATUS_JOB_ID, "running")),
+    );
+    let server = StatusMockServer::start(StatusCode::OK, response).await;
+    let address = server.address.to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        run_cli_owned(vec![
+            "status".into(),
+            "--server-addr".into(),
+            address,
+            STATUS_JOB_ID.into(),
+        ])
+    })
+    .await
+    .expect("CLI subprocess should finish");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert!(stdout.contains(&format!("job_id: {STATUS_JOB_ID}")));
+    assert!(stdout.contains("status: running"));
+    assert!(stdout.contains("submitted_at_ms: 100"));
+    assert!(stdout.contains("updated_at_ms: 120"));
+    assert!(stdout.contains("started_at_ms: 115"));
+    assert!(stdout.contains("finished_at_ms: -"));
+    assert!(stdout.contains("allocation_status: running"));
+    assert!(stdout.contains("allocation_finished_at_ms: -"));
+    assert!(!stdout.contains("private-argument"));
+    assert_eq!(
+        server.requests(),
+        vec![format!("GET /v1/jobs/{STATUS_JOB_ID}")]
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn status_single_job_prints_json_response() {
+    let response = status_job_response(
+        STATUS_JOB_ID,
+        "running",
+        Some(115),
+        Some(status_allocation_response(STATUS_JOB_ID, "running")),
+    );
+    let server = StatusMockServer::start(StatusCode::OK, response.clone()).await;
+    let address = server.address.to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        run_cli_owned(vec![
+            "status".into(),
+            "--server-addr".into(),
+            address,
+            STATUS_JOB_ID.into(),
+            "--json".into(),
+        ])
+    })
+    .await
+    .expect("CLI subprocess should finish");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        response
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("private-env-value"));
+    assert_eq!(
+        server.requests(),
+        vec![format!("GET /v1/jobs/{STATUS_JOB_ID}")]
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn status_list_prints_json_response() {
+    let response = json!({
+        "items": [
+            status_job_response(
+                STATUS_JOB_ID,
+                "running",
+                Some(115),
+                Some(status_allocation_response(STATUS_JOB_ID, "running")),
+            ),
+            status_job_response(STATUS_PENDING_JOB_ID, "pending", None, None),
+        ]
+    });
+    let server = StatusMockServer::start(StatusCode::OK, response.clone()).await;
+    let address = server.address.to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        run_cli_owned(vec![
+            "status".into(),
+            "--server-addr".into(),
+            address,
+            "--json".into(),
+        ])
+    })
+    .await
+    .expect("CLI subprocess should finish");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        response
+    );
+    assert_eq!(server.requests(), vec!["GET /v1/jobs"]);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn status_empty_list_prints_clear_human_message() {
+    let server = StatusMockServer::start(StatusCode::OK, json!({"items": []})).await;
+    let address = server.address.to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        run_cli_owned(vec!["status".into(), "--server-addr".into(), address])
+    })
+    .await
+    .expect("CLI subprocess should finish");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"no jobs found\n");
+    assert!(output.stderr.is_empty());
+    assert_eq!(server.requests(), vec!["GET /v1/jobs"]);
+
+    server.stop().await;
+}
+
 #[test]
-fn environment_values_are_used_and_cli_values_take_precedence() {
+fn status_rejects_invalid_job_id_without_echoing_input() {
+    let invalid_id = "not-a-uuid-secret";
+    let output = run_cli(&["status", "--server-addr", "127.0.0.1:0", invalid_id]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr.contains("job ID must be a valid UUID"));
+    assert!(!stderr.contains(invalid_id));
+    assert!(!stderr.contains("request to control plane"));
+}
+
+#[tokio::test]
+async fn status_not_found_returns_nonzero_and_safe_stderr() {
+    let server = StatusMockServer::start(
+        StatusCode::NOT_FOUND,
+        json!({
+            "code": "not_found",
+            "message": "job was not found",
+            "details": null
+        }),
+    )
+    .await;
+    let address = server.address.to_string();
+    let expected_address = address.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        run_cli_owned(vec![
+            "status".into(),
+            "--server-addr".into(),
+            address,
+            STATUS_JOB_ID.into(),
+        ])
+    })
+    .await
+    .expect("CLI subprocess should finish");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(stderr.contains("job was not found"));
+    assert!(stderr.contains("not_found"));
+    assert!(stderr.contains("404"));
+    assert!(!stderr.contains(&expected_address));
+    assert!(!stderr.contains("http://"));
+    assert_eq!(
+        server.requests(),
+        vec![format!("GET /v1/jobs/{STATUS_JOB_ID}")]
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn environment_values_are_used_and_cli_values_take_precedence() {
     let invalid_environment = [("MAESTRO_SERVER_ADDR", "not-a-socket")];
     let output = run_cli_with_env(&["status"], &invalid_environment);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -532,11 +887,20 @@ fn environment_values_are_used_and_cli_values_take_precedence() {
     assert!(stderr.contains("invalid value for MAESTRO_SERVER_ADDR"));
     assert!(!stderr.contains("not-a-socket"));
 
-    let output = run_cli_with_env(
-        &["status", "--server-addr", "127.0.0.1:9003"],
-        &invalid_environment,
+    let server = StatusMockServer::start(StatusCode::OK, json!({"items": []})).await;
+    let address = server.address.to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        run_cli_with_env(&["status", "--server-addr", &address], &invalid_environment)
+    })
+    .await
+    .expect("CLI subprocess should finish");
+    assert!(
+        output.status.success(),
+        "status command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.status.success());
+    assert_eq!(server.requests(), vec!["GET /v1/jobs"]);
+    server.stop().await;
 }
 
 #[test]

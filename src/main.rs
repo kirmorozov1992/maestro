@@ -1,6 +1,6 @@
 mod application;
 mod config;
-// M7.3–M7.4 consume the remaining status/stop methods.
+// M7.4 consumes the remaining stop method.
 #[allow(dead_code)]
 mod cli_client;
 pub mod domain;
@@ -29,7 +29,7 @@ enum Command {
     Server(ServerOptions),
     Agent(AgentOptions),
     Submit(SubmitOptions),
-    Status(ClientOptions),
+    Status(StatusOptions),
     Stop(ClientOptions),
 }
 
@@ -83,6 +83,16 @@ struct AgentOptions {
 struct ClientOptions {
     #[arg(long, help = config::HELP_SERVER_ADDR)]
     server_addr: Option<SocketAddr>,
+}
+
+#[derive(Debug, Args)]
+struct StatusOptions {
+    #[command(flatten)]
+    client: ClientOptions,
+    #[arg(long, help = "Print the job response as JSON")]
+    json: bool,
+    #[arg(value_name = "JOB_ID")]
+    job_id: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -171,7 +181,8 @@ fn launch(command: Command, environment: &config::Environment) -> Result<(), Lau
             run_submit(options, client_config)?;
         }
         Command::Status(options) => {
-            launch_mode("status", config::client(options.server_addr, environment)?);
+            let client_config = config::client(options.client.server_addr, environment)?;
+            run_status(options, client_config)?;
         }
         Command::Stop(options) => {
             launch_mode("stop", config::client(options.server_addr, environment)?);
@@ -206,6 +217,122 @@ fn run_submit(
     }
 
     Ok(())
+}
+
+fn run_status(
+    options: StatusOptions,
+    client_config: config::ClientConfig,
+) -> Result<(), LaunchError> {
+    let job_id = options
+        .job_id
+        .as_deref()
+        .map(str::parse::<domain::JobId>)
+        .transpose()
+        .map_err(|_| StatusError::InvalidJobId)?;
+    let client = cli_client::CliHttpClient::new(client_config.server_addr)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(StatusError::RuntimeBuild)?;
+
+    match job_id {
+        Some(job_id) => {
+            let response = runtime.block_on(client.get_job(job_id))?;
+            if options.json {
+                println!("{}", serialize_status_json(&response)?);
+            } else {
+                print_job_status(&response);
+            }
+        }
+        None => {
+            let response = runtime.block_on(client.list_jobs())?;
+            if options.json {
+                println!("{}", serialize_status_json(&response)?);
+            } else {
+                print_job_list(&response);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn serialize_status_json(response: &impl serde::Serialize) -> Result<String, StatusError> {
+    serde_json::to_string(response).map_err(StatusError::Json)
+}
+
+fn print_job_list(response: &transport::v1::JobListResponse) {
+    if response.items.is_empty() {
+        println!("no jobs found");
+        return;
+    }
+
+    println!("jobs: {}", response.items.len());
+    for (index, job) in response.items.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        print_job_status(job);
+    }
+}
+
+fn print_job_status(response: &transport::v1::JobResponse) {
+    let job = &response.job;
+    println!("job_id: {}", job.id);
+    println!("status: {}", job_status_label(job.status));
+    println!("submitted_at_ms: {}", job.submitted_at.as_unix_millis());
+    println!("updated_at_ms: {}", job.updated_at.as_unix_millis());
+    print_timestamp("started_at_ms", job.started_at);
+    print_timestamp("finished_at_ms", job.finished_at);
+
+    match &response.allocation {
+        Some(allocation) => {
+            println!("allocation_id: {}", allocation.id);
+            println!(
+                "allocation_status: {}",
+                allocation_status_label(allocation.status)
+            );
+            println!("agent_id: {}", allocation.agent_id);
+            println!("attempt: {}", allocation.attempt);
+            println!(
+                "assigned_at_ms: {}",
+                allocation.assigned_at.as_unix_millis()
+            );
+            print_timestamp("allocation_started_at_ms", allocation.started_at);
+            print_timestamp("allocation_finished_at_ms", allocation.finished_at);
+        }
+        None => println!("allocation: none"),
+    }
+}
+
+fn print_timestamp(label: &str, timestamp: Option<domain::Timestamp>) {
+    match timestamp {
+        Some(timestamp) => println!("{label}: {}", timestamp.as_unix_millis()),
+        None => println!("{label}: -"),
+    }
+}
+
+fn job_status_label(status: transport::v1::JobStatusV1) -> &'static str {
+    match status {
+        transport::v1::JobStatusV1::Pending => "pending",
+        transport::v1::JobStatusV1::Assigned => "assigned",
+        transport::v1::JobStatusV1::Running => "running",
+        transport::v1::JobStatusV1::Succeeded => "succeeded",
+        transport::v1::JobStatusV1::Failed => "failed",
+        transport::v1::JobStatusV1::Stopped => "stopped",
+        transport::v1::JobStatusV1::Lost => "lost",
+    }
+}
+
+fn allocation_status_label(status: transport::v1::AllocationStatusV1) -> &'static str {
+    match status {
+        transport::v1::AllocationStatusV1::Assigned => "assigned",
+        transport::v1::AllocationStatusV1::Running => "running",
+        transport::v1::AllocationStatusV1::Succeeded => "succeeded",
+        transport::v1::AllocationStatusV1::Failed => "failed",
+        transport::v1::AllocationStatusV1::Stopped => "stopped",
+        transport::v1::AllocationStatusV1::Lost => "lost",
+    }
 }
 
 fn submit_request(
@@ -251,7 +378,44 @@ enum LaunchError {
     CliClient(cli_client::CliClientError),
     Configuration(config::ConfigError),
     Server(server::ServerError),
+    Status(StatusError),
     Submit(SubmitError),
+}
+
+enum StatusError {
+    InvalidJobId,
+    Json(serde_json::Error),
+    RuntimeBuild(std::io::Error),
+}
+
+impl fmt::Debug for StatusError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidJobId => formatter.write_str("StatusError::InvalidJobId"),
+            Self::Json(_) => formatter.write_str("StatusError::Json"),
+            Self::RuntimeBuild(_) => formatter.write_str("StatusError::RuntimeBuild"),
+        }
+    }
+}
+
+impl fmt::Display for StatusError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidJobId => formatter.write_str("job ID must be a valid UUID"),
+            Self::Json(_) => formatter.write_str("could not serialize status response"),
+            Self::RuntimeBuild(_) => formatter.write_str("could not initialize CLI runtime"),
+        }
+    }
+}
+
+impl Error for StatusError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Json(source) => Some(source),
+            Self::RuntimeBuild(source) => Some(source),
+            Self::InvalidJobId => None,
+        }
+    }
 }
 
 enum SubmitError {
@@ -338,6 +502,12 @@ impl From<SubmitError> for LaunchError {
     }
 }
 
+impl From<StatusError> for LaunchError {
+    fn from(error: StatusError) -> Self {
+        Self::Status(error)
+    }
+}
+
 impl From<config::ConfigError> for LaunchError {
     fn from(error: config::ConfigError) -> Self {
         Self::Configuration(error)
@@ -357,6 +527,7 @@ impl fmt::Display for LaunchError {
             Self::CliClient(error) => error.fmt(formatter),
             Self::Configuration(error) => error.fmt(formatter),
             Self::Server(error) => error.fmt(formatter),
+            Self::Status(error) => error.fmt(formatter),
             Self::Submit(error) => error.fmt(formatter),
         }
     }
@@ -369,6 +540,7 @@ impl Error for LaunchError {
             Self::CliClient(error) => Some(error),
             Self::Configuration(error) => Some(error),
             Self::Server(error) => Some(error),
+            Self::Status(error) => Some(error),
             Self::Submit(error) => Some(error),
         }
     }
