@@ -83,7 +83,7 @@ fn job_process_fixture() {
             "m81-secret-env-value"
         );
     }
-    fs::write(&marker, b"").unwrap();
+    fs::write(&marker, std::process::id().to_string()).unwrap();
     match mode.as_str() {
         "success" => {}
         "fail" => std::process::exit(7),

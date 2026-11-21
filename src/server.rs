@@ -35,6 +35,7 @@ use tokio::net::TcpListener;
 pub(crate) enum ServerError {
     Runtime(io::Error),
     Bind(io::Error),
+    ShutdownSignal(io::Error),
     Serve(io::Error),
     SchedulerLoop(SchedulerLoopError),
     Logging(Box<dyn Error + Send + Sync>),
@@ -52,6 +53,9 @@ impl fmt::Display for ServerError {
             Self::Runtime(_) => formatter.write_str("server runtime could not be created"),
             Self::Bind(_) => formatter.write_str("server could not bind to the configured address"),
             Self::Serve(_) => formatter.write_str("HTTP server stopped with an I/O error"),
+            Self::ShutdownSignal(_) => {
+                formatter.write_str("server shutdown signal listener could not be installed")
+            }
             Self::SchedulerLoop(error) => {
                 write!(formatter, "scheduler could not start or stop ({error})")
             }
@@ -63,7 +67,10 @@ impl fmt::Display for ServerError {
 impl Error for ServerError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Runtime(source) | Self::Bind(source) | Self::Serve(source) => Some(source),
+            Self::Runtime(source)
+            | Self::Bind(source)
+            | Self::Serve(source)
+            | Self::ShutdownSignal(source) => Some(source),
             Self::SchedulerLoop(source) => Some(source),
             Self::Logging(source) => Some(source.as_ref()),
         }
@@ -85,10 +92,11 @@ pub(crate) fn run(config: ServerConfig) -> Result<(), ServerError> {
         .build()
         .map_err(ServerError::Runtime)?;
     runtime.block_on(async move {
+        let shutdown = shutdown_signal().map_err(ServerError::ShutdownSignal)?;
         let listener = TcpListener::bind(config.bind_addr)
             .await
             .map_err(ServerError::Bind)?;
-        run_with_listener(config, listener, shutdown_signal()).await
+        run_with_listener(config, listener, shutdown).await
     })
 }
 
@@ -589,49 +597,39 @@ where
     }
 }
 
-async fn shutdown_signal() {
+fn shutdown_signal() -> io::Result<impl Future<Output = ()> + Send + 'static> {
+    // Install Unix listeners before binding the server, so signals received
+    // before Axum polls the waiter are still observed.
     #[cfg(unix)]
-    {
+    let (mut interrupt, mut terminate) = {
         use tokio::signal::unix::{SignalKind, signal};
+        (
+            signal(SignalKind::interrupt())?,
+            signal(SignalKind::terminate())?,
+        )
+    };
 
-        let terminate = signal(SignalKind::terminate());
-        let terminate_signal = async move {
-            match terminate {
-                Ok(mut stream) => {
-                    stream.recv().await;
-                }
-                Err(error) => {
-                    tracing::error!(
-                        event = "shutdown_signal_registration_failed",
-                        signal = "sigterm",
-                        error = %error
-                    );
-                    std::future::pending::<()>().await;
-                }
-            }
+    Ok(async move {
+        #[cfg(unix)]
+        let signal = tokio::select! {
+            _ = interrupt.recv() => "sigint",
+            _ = terminate.recv() => "sigterm",
         };
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                if let Err(error) = result {
-                    tracing::error!(
-                        event = "shutdown_signal_wait_failed",
-                        signal = "ctrl_c",
-                        error = %error
-                    );
-                }
+
+        #[cfg(not(unix))]
+        let signal = {
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                tracing::error!(
+                    event = "shutdown_signal_wait_failed",
+                    signal = "ctrl_c",
+                    error = %error
+                );
             }
-            () = terminate_signal => {}
-        }
-    }
-    #[cfg(not(unix))]
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        tracing::error!(
-            event = "shutdown_signal_wait_failed",
-            signal = "ctrl_c",
-            error = %error
-        );
-    }
-    tracing::info!(event = "shutdown_signal_received");
+            "ctrl_c"
+        };
+
+        tracing::info!(event = "shutdown_signal_received", signal);
+    })
 }
 
 #[cfg(test)]

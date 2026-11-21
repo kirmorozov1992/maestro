@@ -1,13 +1,5 @@
 use super::*;
 
-struct ReleaseProcess(PathBuf);
-
-impl Drop for ReleaseProcess {
-    fn drop(&mut self) {
-        let _ = fs::write(&self.0, b"");
-    }
-}
-
 #[tokio::test]
 async fn server_loss_interrupts_heartbeat_and_terminal_reporting() {
     let mut harness = Harness::start(Duration::from_secs(25)).await.unwrap();

@@ -205,6 +205,14 @@ fn maestro() -> Command {
     command
 }
 
+struct ReleaseProcess(PathBuf);
+
+impl Drop for ReleaseProcess {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.0, b"");
+    }
+}
+
 struct TempDir(PathBuf);
 
 impl TempDir {
@@ -395,6 +403,10 @@ impl Drop for Process {
 #[cfg(test)]
 #[path = "failures.rs"]
 mod failures;
+
+#[cfg(test)]
+#[path = "shutdown.rs"]
+mod shutdown;
 
 #[cfg(test)]
 mod tests {

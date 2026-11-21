@@ -269,6 +269,10 @@ impl AssignmentHandler for LifecycleRunner {
                     return pending().await;
                 }
                 active.started_accepted = true;
+                tracing::debug!(
+                    event = "agent_start_acknowledged", job_id = %active.job_id,
+                    allocation_id = %active.allocation_id, agent_id = %active.agent_id
+                );
                 let Some(process) = active.process.as_mut() else {
                     return pending().await;
                 };

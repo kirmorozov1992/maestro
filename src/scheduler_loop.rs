@@ -220,5 +220,11 @@ mod tests {
         scheduler_loop.stop().unwrap();
 
         assert!(stop_started_at.elapsed() < Duration::from_secs(1));
+        // The callback owns the sender, so disconnection proves it was dropped.
+        while tick_receiver.try_recv().is_ok() {}
+        assert_eq!(
+            tick_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        );
     }
 }

@@ -114,3 +114,68 @@ async fn unix_signals_reap_active_child_report_stopped_and_never_launch_queued_j
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[tokio::test]
+async fn signal_listener_is_installed_before_its_waiter_is_polled() {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    for signal in [SignalKind::interrupt(), SignalKind::terminate()] {
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "server::tests::shutdown_tests::early_server_signal_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stdin = child.stdin.take().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                assert_ne!(
+                    stdout.read_line(&mut line).await.unwrap(),
+                    0,
+                    "fixture exited before ready"
+                );
+                if line.trim_end() == "shutdown-listener-ready" {
+                    break;
+                }
+            }
+            send_signal(&child, signal);
+            // The fixture may only poll the waiter after the test sends the signal.
+            let _ = stdin.write_all(b"x").await;
+            assert!(
+                child.wait().await.unwrap().success(),
+                "signal reached the default disposition"
+            );
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[test]
+#[ignore = "owned subprocess for testing the server signal registration order"]
+fn early_server_signal_fixture() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let shutdown = super::super::shutdown_signal().unwrap();
+        println!("shutdown-listener-ready");
+        std::io::stdout().flush().unwrap();
+        tokio::task::spawn_blocking(|| std::io::stdin().read_exact(&mut [0; 1]))
+            .await
+            .unwrap()
+            .unwrap();
+        shutdown.await;
+    });
+}
