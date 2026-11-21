@@ -785,22 +785,37 @@ mod tests {
         content_type: &str,
         body: &str,
     ) -> String {
-        let method = method.to_owned();
-        let path = path.to_owned();
-        let content_type = content_type.to_owned();
-        let body = body.to_owned();
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        exchange_http(address, request.into_bytes()).await
+    }
+
+    async fn http_chunked_job_request(address: SocketAddr, body: &str) -> String {
+        let mut request = b"POST /v1/jobs HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+        for chunk in body.as_bytes().chunks(16 * 1024) {
+            write!(request, "{:x}\r\n", chunk.len()).unwrap();
+            request.extend_from_slice(chunk);
+            request.extend_from_slice(b"\r\n");
+        }
+        request.extend_from_slice(b"0\r\n\r\n");
+        exchange_http(address, request).await
+    }
+
+    async fn exchange_http(address: SocketAddr, request: Vec<u8>) -> String {
         tokio::task::spawn_blocking(move || {
             let mut stream = std::net::TcpStream::connect(address)
                 .expect("test server should accept the request");
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .expect("read timeout should be set");
-            write!(
-                stream,
-                "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .expect("request should be written");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("write timeout should be set");
+            stream
+                .write_all(&request)
+                .expect("request should be written");
             let mut response = String::new();
             stream
                 .read_to_string(&mut response)
@@ -935,9 +950,17 @@ mod tests {
         assert_eq!(response_json(&over_limit)["code"], "invalid_input");
         assert!(!over_limit.contains("request-marker"));
 
+        let chunked_at_limit = http_chunked_job_request(address, &body_at_limit).await;
+        assert_eq!(response_status(&chunked_at_limit), 201);
+
+        let chunked_over_limit = http_chunked_job_request(address, &body_over_limit).await;
+        assert_eq!(response_status(&chunked_over_limit), 413);
+        assert_eq!(response_json(&chunked_over_limit)["code"], "invalid_input");
+        assert!(!chunked_over_limit.contains("request-marker"));
+
         let jobs = http_request(address, "GET", "/v1/jobs", "").await;
         assert_eq!(response_status(&jobs), 200);
-        assert_eq!(response_json(&jobs)["items"].as_array().unwrap().len(), 1);
+        assert_eq!(response_json(&jobs)["items"].as_array().unwrap().len(), 2);
 
         shutdown_sender
             .send(())
@@ -998,6 +1021,78 @@ mod tests {
             .await
             .expect("test server task should finish")
             .expect("test router should stop cleanly");
+    }
+
+    #[tokio::test]
+    async fn job_requests_preserve_unicode_and_reject_invalid_spec_without_inserting_jobs() {
+        let store = StateStore::default();
+        let (address, shutdown_sender, server) = start_test_router(store.clone()).await;
+        let request = json!({
+            "command": "программа",
+            "args": ["", "é", "🧪"],
+            "env": {"ПУСТО": "", "РЕЖИМ": "unique-environment-value"},
+            "working_dir": "рабочая папка",
+        });
+        let response = http_request(address, "POST", "/v1/jobs", &request.to_string()).await;
+        assert_eq!(response_status(&response), 201);
+        let spec = &response_json(&response)["spec"];
+        assert_eq!(spec["command"], request["command"]);
+        assert_eq!(spec["args"], request["args"]);
+        assert_eq!(spec["working_dir"], request["working_dir"]);
+        assert_eq!(spec["env_keys"], json!(["ПУСТО", "РЕЖИМ"]));
+        assert!(!response.contains("unique-environment-value"));
+
+        for (body, status) in [
+            (
+                r#"{"command":"echo","env":{"MODE":"private-value","MODE":"other"}}"#.to_owned(),
+                422,
+            ),
+            (json!({"command":""}).to_string(), 400),
+            (json!({"command":"\u{2003}\u{00a0}"}).to_string(), 400),
+            (json!({"command":"echo","working_dir":""}).to_string(), 400),
+            (
+                json!({"command":"echo","working_dir":"\u{2003}"}).to_string(),
+                400,
+            ),
+            (json!({"command":"echo","args":[null]}).to_string(), 422),
+        ] {
+            let response = http_request(address, "POST", "/v1/jobs", &body).await;
+            assert_eq!(response_status(&response), status);
+            assert_eq!(
+                response_json(&response),
+                json!({"code":"invalid_input", "message":"request contains invalid input"})
+            );
+            assert!(!response.contains("private-value"));
+        }
+        assert_eq!(store.list_jobs().unwrap().len(), 1);
+        shutdown_sender.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_allocation_result_does_not_change_assignment() {
+        let (store, job_id, agent_id, allocation_id) = agent_assignment_store();
+        let (address, shutdown_sender, server) =
+            start_test_router_with_timeout(store.clone(), Duration::from_millis(u64::MAX)).await;
+        let path = format!("/v1/allocations/{allocation_id}/events");
+        let request = json!({
+            "type":"finished", "job_id":job_id, "agent_id":agent_id, "occurred_at":1_001,
+            "result":{"type":"spawn_failed", "message":"private-value"},
+        });
+        let rejected = http_request(address, "POST", &path, &request.to_string()).await;
+        assert_eq!(response_status(&rejected), 422);
+        assert_eq!(response_json(&rejected)["code"], "invalid_input");
+        assert!(!rejected.contains("private-value"));
+        assert_eq!(store.get_job(job_id).unwrap().status(), JobStatus::Assigned);
+        let mut valid = request;
+        valid["result"] = json!({"type":"spawn_failed"});
+        assert_eq!(
+            response_status(&http_request(address, "POST", &path, &valid.to_string()).await),
+            200
+        );
+        assert_eq!(store.get_job(job_id).unwrap().status(), JobStatus::Failed);
+        shutdown_sender.send(()).unwrap();
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]

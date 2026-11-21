@@ -262,7 +262,7 @@ impl<'de> Deserialize<'de> for UniqueEnvironment {
     }
 }
 
-fn deserialize_environment<'de, D>(
+pub(crate) fn deserialize_environment<'de, D>(
     deserializer: D,
 ) -> Result<Option<BTreeMap<String, String>>, D::Error>
 where
@@ -410,46 +410,94 @@ mod tests {
     }
 
     #[test]
+    fn empty_arguments_still_consume_the_aggregate_budget() {
+        assert!(
+            JobSpec::new(
+                "program",
+                vec![String::new(); MAX_ARGUMENTS_BYTES],
+                None,
+                None
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            JobSpec::new(
+                "program",
+                vec![String::new(); MAX_ARGUMENTS_BYTES + 1],
+                None,
+                None
+            )
+            .unwrap_err(),
+            JobSpecError::ArgumentsTooLong {
+                actual_bytes: MAX_ARGUMENTS_BYTES + 1,
+                max_bytes: MAX_ARGUMENTS_BYTES,
+            }
+        );
+    }
+
+    #[test]
     fn enforces_utf8_byte_limits_including_exact_boundaries() {
         let at_limit = JobSpec::new(
-            "x".repeat(MAX_COMMAND_BYTES),
-            vec!["x".repeat(MAX_ARGUMENTS_BYTES - 1)],
+            "é".repeat(MAX_COMMAND_BYTES / 2),
+            vec!["é".repeat((MAX_ARGUMENTS_BYTES - 2) / 2) + "x"],
             Some(BTreeMap::from([(
-                "K".into(),
-                "x".repeat(MAX_ENVIRONMENT_BYTES - 3),
+                "К".into(),
+                "é".repeat((MAX_ENVIRONMENT_BYTES - 4) / 2),
             )])),
-            Some("x".repeat(MAX_WORKING_DIR_BYTES)),
+            Some("é".repeat(MAX_WORKING_DIR_BYTES / 2)),
         );
         assert!(at_limit.is_ok());
 
-        assert!(matches!(
-            JobSpec::new("é".repeat(MAX_COMMAND_BYTES / 2 + 1), vec![], None, None),
-            Err(JobSpecError::CommandTooLong { .. })
-        ));
-        assert!(matches!(
-            JobSpec::new("program", vec!["x".repeat(MAX_ARGUMENTS_BYTES)], None, None),
-            Err(JobSpecError::ArgumentsTooLong { .. })
-        ));
-        assert!(matches!(
-            JobSpec::new(
-                "program",
-                vec![],
-                Some(BTreeMap::from([(
-                    "K".into(),
-                    "x".repeat(MAX_ENVIRONMENT_BYTES - 2)
-                )])),
-                None
+        let one_byte_over_limit = [
+            (
+                JobSpec::new("é".repeat(MAX_COMMAND_BYTES / 2) + "x", vec![], None, None),
+                JobSpecError::CommandTooLong {
+                    actual_bytes: MAX_COMMAND_BYTES + 1,
+                    max_bytes: MAX_COMMAND_BYTES,
+                },
             ),
-            Err(JobSpecError::EnvironmentTooLong { .. })
-        ));
-        assert!(matches!(
-            JobSpec::new(
-                "program",
-                vec![],
-                None,
-                Some("x".repeat(MAX_WORKING_DIR_BYTES + 1))
+            (
+                JobSpec::new(
+                    "program",
+                    vec!["é".repeat(MAX_ARGUMENTS_BYTES / 2)],
+                    None,
+                    None,
+                ),
+                JobSpecError::ArgumentsTooLong {
+                    actual_bytes: MAX_ARGUMENTS_BYTES + 1,
+                    max_bytes: MAX_ARGUMENTS_BYTES,
+                },
             ),
-            Err(JobSpecError::WorkingDirectoryTooLong { .. })
-        ));
+            (
+                JobSpec::new(
+                    "program",
+                    vec![],
+                    Some(BTreeMap::from([(
+                        "К".into(),
+                        "é".repeat((MAX_ENVIRONMENT_BYTES - 4) / 2) + "x",
+                    )])),
+                    None,
+                ),
+                JobSpecError::EnvironmentTooLong {
+                    actual_bytes: MAX_ENVIRONMENT_BYTES + 1,
+                    max_bytes: MAX_ENVIRONMENT_BYTES,
+                },
+            ),
+            (
+                JobSpec::new(
+                    "program",
+                    vec![],
+                    None,
+                    Some("é".repeat(MAX_WORKING_DIR_BYTES / 2) + "x"),
+                ),
+                JobSpecError::WorkingDirectoryTooLong {
+                    actual_bytes: MAX_WORKING_DIR_BYTES + 1,
+                    max_bytes: MAX_WORKING_DIR_BYTES,
+                },
+            ),
+        ];
+        for (result, expected) in one_byte_over_limit {
+            assert_eq!(result.unwrap_err(), expected);
+        }
     }
 }

@@ -536,16 +536,19 @@ mod tests {
     #[tokio::test]
     async fn resolves_relative_executable_from_validated_job_working_directory() {
         let root = TestRoot::new();
-        let job_dir = root.0.join("job directory");
+        let job_dir = root.0.join("рабочий каталог");
         fs::create_dir(&job_dir).unwrap();
-        let program = job_dir.join("fixture program");
+        let program = job_dir.join("тестовая программа");
         fs::copy(executable(), &program).unwrap();
         let output = root.0.join("cwd.json");
+        let mut environment = fixture_env("inspect", &output);
+        environment.insert(OVERRIDE.into(), String::new());
+        let literal = ["", "аргумент", "🧪"];
         let spec = JobSpec::new(
-            "./fixture program",
-            fixture_args(&[]),
-            Some(fixture_env("inspect", &output)),
-            Some("job directory".into()),
+            "./тестовая программа",
+            fixture_args(&literal),
+            Some(environment),
+            Some("рабочий каталог".into()),
         )
         .unwrap();
         let mut child = Executor::new(&root.0).unwrap().spawn(&spec).unwrap();
@@ -558,6 +561,12 @@ mod tests {
         );
         let observed: Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
         assert_eq!(observed["cwd"], json!(job_dir.canonicalize().unwrap()));
+        let args = observed["args"].as_array().unwrap();
+        assert_eq!(
+            &args[args.len() - literal.len()..],
+            literal.map(Value::from)
+        );
+        assert_eq!(observed["overridden"], "");
     }
 
     #[cfg(unix)]
@@ -719,6 +728,15 @@ mod tests {
         let spec = JobSpec::new(program.to_str().unwrap(), vec![], None, None).unwrap();
         let error = Executor::new(&root.0).unwrap().spawn(&spec).unwrap_err();
         assert_eq!(error.code(), "process_spawn_permission_denied");
+        assert_eq!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
         assert!(!format!("{error} {error:?}").contains("private"));
     }
 

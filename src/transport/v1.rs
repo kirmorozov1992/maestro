@@ -5,7 +5,7 @@ use crate::{
         AgentSnapshot, AllocationId, AllocationSnapshot,
         AllocationStatus as DomainAllocationStatus, ApplyOutcome, JobEvent, JobId, JobSnapshot,
         JobSpec, JobSpecError, JobStatus as DomainJobStatus, ProcessResult, StopReason,
-        TerminalResult, Timestamp,
+        TerminalResult, Timestamp, deserialize_environment,
     },
     error::AppError,
 };
@@ -18,6 +18,7 @@ pub(crate) struct CreateJobRequest {
     pub(crate) command: String,
     #[serde(default)]
     pub(crate) args: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_environment")]
     pub(crate) env: Option<BTreeMap<String, String>>,
     pub(crate) working_dir: Option<String>,
 }
@@ -54,8 +55,9 @@ pub(crate) struct RegisterAgentRequest {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ProcessResultV1 {
     Exited { exit_code: i32 },
-    SpawnFailed,
-    ExecutionFailed,
+    // Struct variants apply deny_unknown_fields even without result data.
+    SpawnFailed {},
+    ExecutionFailed {},
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -112,8 +114,8 @@ impl AllocationEventRequest {
                 occurred_at,
                 result: match result {
                     ProcessResultV1::Exited { exit_code } => ProcessResult::Exited { exit_code },
-                    ProcessResultV1::SpawnFailed => ProcessResult::SpawnFailed,
-                    ProcessResultV1::ExecutionFailed => ProcessResult::ExecutionFailed,
+                    ProcessResultV1::SpawnFailed {} => ProcessResult::SpawnFailed,
+                    ProcessResultV1::ExecutionFailed {} => ProcessResult::ExecutionFailed,
                 },
             },
             Self::Stopped {
@@ -379,6 +381,7 @@ impl From<crate::state::store::StopCommand> for StopCommandResponse {
 pub(crate) struct ExecutionSpec {
     pub(crate) command: String,
     pub(crate) args: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_environment")]
     pub(crate) env: Option<BTreeMap<String, String>>,
     pub(crate) working_dir: Option<String>,
 }
@@ -643,6 +646,17 @@ mod tests {
     }
 
     #[test]
+    fn job_request_and_execution_spec_reject_duplicate_environment_keys() {
+        for payload in [
+            r#"{"command":"program","args":[],"env":{"K":"one","K":"two"}}"#,
+            r#"{"command":"program","args":[],"env":{"K":"one","\u004b":"two"}}"#,
+        ] {
+            assert!(serde_json::from_str::<CreateJobRequest>(payload).is_err());
+            assert!(serde_json::from_str::<super::ExecutionSpec>(payload).is_err());
+        }
+    }
+
+    #[test]
     fn create_job_request_accepts_null_optional_fields_and_preserves_empty_env() {
         let absent: CreateJobRequest = serde_json::from_value(json!({
             "command": "echo",
@@ -733,6 +747,21 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn failure_results_reject_unknown_fields_and_preserve_wire_shape() {
+        for kind in ["spawn_failed", "execution_failed"] {
+            let result = json!({"type": kind});
+            let valid: super::ProcessResultV1 = serde_json::from_value(result.clone()).unwrap();
+            assert_eq!(serde_json::to_value(valid).unwrap(), result);
+            for invalid in [
+                json!({"type": kind, "exit_code": 0}),
+                json!({"type": kind, "message": "unexpected"}),
+            ] {
+                assert!(serde_json::from_value::<super::ProcessResultV1>(invalid).is_err());
+            }
+        }
     }
 
     #[test]

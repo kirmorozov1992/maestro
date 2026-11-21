@@ -16,6 +16,7 @@ pub use dto::{AgentSnapshot, AllocationSnapshot, JobSnapshot};
 pub use event::{JobEvent, LostReason, ProcessResult, StopReason};
 pub use id::{AgentId, AllocationId, JobId};
 pub use job::{Job, JobStatus, TerminalResult};
+pub(crate) use job_spec::deserialize_environment;
 pub use job_spec::{
     JobSpec, JobSpecError, MAX_ARGUMENTS_BYTES, MAX_COMMAND_BYTES, MAX_ENVIRONMENT_BYTES,
     MAX_WORKING_DIR_BYTES,

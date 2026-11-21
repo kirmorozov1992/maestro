@@ -159,7 +159,7 @@ impl LifecycleRunner {
 fn process_result(status: ExitStatus) -> ProcessResultV1 {
     match status.code() {
         Some(exit_code) => ProcessResultV1::Exited { exit_code },
-        None => ProcessResultV1::ExecutionFailed,
+        None => ProcessResultV1::ExecutionFailed {},
     }
 }
 
@@ -300,14 +300,14 @@ impl AssignmentHandler for LifecycleRunner {
                         tracing::warn!(event="agent_process_wait_failed", job_id=%active.job_id,
                             allocation_id=%active.allocation_id, agent_id=%active.agent_id, code=error.code());
                         active.cleanup().await?;
-                        active.finished(ProcessResultV1::ExecutionFailed)
+                        active.finished(ProcessResultV1::ExecutionFailed {})
                     }
                 }
             }
             Err(error) => {
                 tracing::warn!(event="agent_process_spawn_failed", job_id=%active.job_id,
                     allocation_id=%active.allocation_id, agent_id=%active.agent_id, code=error.code());
-                active.finished(ProcessResultV1::SpawnFailed)
+                active.finished(ProcessResultV1::SpawnFailed {})
             }
         };
         active.terminal_attempted = true;

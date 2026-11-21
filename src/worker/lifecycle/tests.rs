@@ -354,7 +354,7 @@ fn signal_outcome_is_failure_without_fabricated_exit_code() {
     use std::os::unix::process::ExitStatusExt;
     assert_eq!(
         process_result(std::process::ExitStatus::from_raw(9)),
-        ProcessResultV1::ExecutionFailed
+        ProcessResultV1::ExecutionFailed {}
     );
 }
 

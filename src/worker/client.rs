@@ -565,7 +565,7 @@ mod tests {
                 job_id: job_id(),
                 agent_id: agent_id(),
                 occurred_at: Timestamp::from_unix_millis(131),
-                result: ProcessResultV1::SpawnFailed,
+                result: ProcessResultV1::SpawnFailed {},
             },
             AllocationEventRequest::Stopped {
                 job_id: job_id(),
