@@ -393,6 +393,10 @@ impl Drop for Process {
 }
 
 #[cfg(test)]
+#[path = "failures.rs"]
+mod failures;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

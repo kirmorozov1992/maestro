@@ -722,6 +722,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn terminal_report_loses_connection_after_the_peer_reads_it() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = AgentHttpClient::new(address, Duration::from_secs(3)).unwrap();
+        let allocation = allocation_id();
+        let expected = format!("POST /v1/allocations/{allocation}/events HTTP/1.1");
+        let peer = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            assert_eq!(line.trim_end(), expected);
+            let mut content_length = None;
+            loop {
+                line.clear();
+                assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut body = vec![0; content_length.unwrap()];
+            stream.read_exact(&mut body).await.unwrap();
+            let event: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(event["type"], "finished");
+            assert_eq!(event["job_id"], job_id().to_string());
+            assert_eq!(event["result"], json!({"type":"exited", "exit_code":0}));
+            // Close after the request reaches the peer, before sending a response.
+        };
+        let report = client.report_event(
+            allocation,
+            AllocationEventRequest::Finished {
+                job_id: job_id(),
+                agent_id: agent_id(),
+                occurred_at: Timestamp::from_unix_millis(123),
+                result: ProcessResultV1::Exited { exit_code: 0 },
+            },
+        );
+        let (result, ()) =
+            tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(report, peer) })
+                .await
+                .unwrap();
+        assert!(matches!(
+            result,
+            Err(AgentClientError::Transport(error)) if !error.is_timeout() && error.url().is_none()
+        ));
+    }
+
     #[test]
     fn zero_request_timeout_is_rejected() {
         assert!(matches!(

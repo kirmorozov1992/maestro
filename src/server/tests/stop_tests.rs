@@ -75,20 +75,101 @@ async fn completed_allocation_does_not_deliver_old_stop() {
         response_status(&http_request(address, "POST", &format!("/v1/jobs/{job}/stop"), "").await),
         202
     );
-    store
-        .append_event(&crate::domain::JobEvent::Finished {
-            job_id: job,
-            agent_id: agent,
-            allocation_id: allocation,
-            occurred_at: Timestamp::from_unix_millis(3000),
-            result: crate::domain::ProcessResult::Exited { exit_code: 0 },
-        })
-        .unwrap();
     let client = AgentHttpClient::new(address, Duration::from_secs(2)).unwrap();
+    assert!(client.poll_stop(agent, allocation).await.unwrap().is_some());
+
+    let finished = json!({
+        "type":"finished", "job_id":job, "agent_id":agent, "occurred_at":3000,
+        "result":{"type":"exited", "exit_code":0},
+    });
+    let response = http_request(
+        address,
+        "POST",
+        &format!("/v1/allocations/{allocation}/events"),
+        &finished.to_string(),
+    )
+    .await;
+    assert_eq!(response_status(&response), 200);
+    assert_eq!(response_json(&response)["outcome"], "applied");
     assert_eq!(client.poll_stop(agent, allocation).await.unwrap(), None);
     assert_eq!(store.get_job(job).unwrap().status(), JobStatus::Succeeded);
+    let late_stop = http_request(address, "POST", &format!("/v1/jobs/{job}/stop"), "").await;
+    assert_eq!(response_status(&late_stop), 409);
     stop.send(()).unwrap();
-    server.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_http_stop_and_completion_keep_the_recorded_result() {
+    let (store, job, agent, allocation) = agent_assignment_store();
+    let (address, stop, server) =
+        start_test_router_with_timeout(store.clone(), Duration::from_millis(u64::MAX)).await;
+    let event_path = format!("/v1/allocations/{allocation}/events");
+    let job_stop_path = format!("/v1/jobs/{job}/stop");
+    let started = json!({"type":"started", "job_id":job, "agent_id":agent, "occurred_at":2000});
+    assert_eq!(
+        response_status(&http_request(address, "POST", &event_path, &started.to_string()).await),
+        200
+    );
+    let finished = json!({
+        "type":"finished", "job_id":job, "agent_id":agent, "occurred_at":3000,
+        "result":{"type":"exited", "exit_code":0},
+    })
+    .to_string();
+    let (stop_response, finished_response) = tokio::join!(
+        http_request(address, "POST", &job_stop_path, ""),
+        http_request(address, "POST", &event_path, &finished),
+    );
+    match response_status(&stop_response) {
+        202 => assert_eq!(
+            response_json(&stop_response),
+            json!({"outcome":"requested", "job_id":job, "agent_id":agent, "allocation_id":allocation})
+        ),
+        409 => assert_eq!(response_json(&stop_response)["code"], "conflict"),
+        actual => panic!("unexpected stop status {actual}: {stop_response}"),
+    }
+    assert_eq!(response_status(&finished_response), 200);
+    assert_eq!(response_json(&finished_response)["outcome"], "applied");
+
+    let job_after = store.get_job(job).unwrap();
+    let allocation_after = store.get_allocation(allocation).unwrap();
+    assert_eq!(job_after.status(), JobStatus::Succeeded);
+    assert_eq!(
+        job_after.terminal_result(),
+        Some(crate::domain::TerminalResult::Exited { exit_code: 0 })
+    );
+    assert_eq!(
+        allocation_after.status(),
+        crate::domain::AllocationStatus::Succeeded
+    );
+    assert_eq!(store.poll_stop(agent, allocation).unwrap(), None);
+    let agent_after = store.get_agent(agent).unwrap();
+    assert_eq!(
+        agent_after.availability(),
+        crate::domain::AgentAvailability::Idle
+    );
+
+    let late_stop = http_request(address, "POST", &job_stop_path, "").await;
+    assert_eq!(response_status(&late_stop), 409);
+    assert_eq!(response_json(&late_stop)["code"], "conflict");
+    let duplicate = http_request(address, "POST", &event_path, &finished).await;
+    assert_eq!(response_status(&duplicate), 200);
+    assert_eq!(response_json(&duplicate)["outcome"], "duplicate");
+    assert_eq!(store.get_job(job).unwrap(), job_after);
+    assert_eq!(store.get_allocation(allocation).unwrap(), allocation_after);
+    assert_eq!(store.get_agent(agent).unwrap(), agent_after);
+    assert_eq!(store.poll_stop(agent, allocation).unwrap(), None);
+
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }
 
 pub(super) async fn submit_wait(

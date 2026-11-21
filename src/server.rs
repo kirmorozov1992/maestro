@@ -1258,9 +1258,10 @@ mod tests {
     async fn assignment_poll_is_sticky_and_delivers_env_only_in_execution_payload() {
         let (store, job_id, agent_id, allocation_id) = agent_assignment_store();
         let (address, shutdown_sender, server) =
-            start_test_router_with_timeout(store, Duration::from_millis(u64::MAX)).await;
+            start_test_router_with_timeout(store.clone(), Duration::from_millis(u64::MAX)).await;
         let path = format!("/v1/agents/{agent_id}/assignments/next");
 
+        let before = store.get_job_with_allocation(job_id).unwrap();
         let first = http_request(address, "GET", &path, "").await;
         assert_eq!(response_status(&first), 200);
         let first_json = response_json(&first);
@@ -1273,10 +1274,11 @@ mod tests {
 
         let repeated = http_request(address, "GET", &path, "").await;
         assert_eq!(response_status(&repeated), 200);
-        assert_eq!(
-            response_json(&repeated)["allocation"]["id"],
-            allocation_id.to_string()
-        );
+        let repeated_json = response_json(&repeated);
+        assert_eq!(repeated_json["job"], first_json["job"]);
+        assert_eq!(repeated_json["allocation"], first_json["allocation"]);
+        assert_eq!(repeated_json["execution"], first_json["execution"]);
+        assert_eq!(store.get_job_with_allocation(job_id).unwrap(), before);
 
         shutdown_sender
             .send(())
@@ -1335,9 +1337,11 @@ mod tests {
         assert_eq!(response_status(&started), 200);
         assert_eq!(response_json(&started)["outcome"], "applied");
 
+        let running = store.get_job_with_allocation(job_id).unwrap();
         let repeated_start = http_request(address, "POST", &path, &started_body).await;
         assert_eq!(response_status(&repeated_start), 200);
         assert_eq!(response_json(&repeated_start)["outcome"], "duplicate");
+        assert_eq!(store.get_job_with_allocation(job_id).unwrap(), running);
 
         let stale_finish = http_request(
             address,
