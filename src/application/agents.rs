@@ -20,13 +20,6 @@ pub(crate) struct AgentsService {
     store: StateStore,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "application services are connected to transport in M5"
-    )
-)]
 impl AgentsService {
     pub(crate) fn new(store: StateStore) -> Self {
         Self { store }

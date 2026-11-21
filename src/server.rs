@@ -118,7 +118,8 @@ where
         .start(
             scheduler_tick_with_clock(
                 Scheduler::new(store),
-                state.assignment_timeout,
+                state.agents.clone(),
+                &config,
                 current_timestamp,
             ),
             |error| tracing::error!(event = "scheduler_tick_failed", error = %error),
@@ -482,12 +483,15 @@ fn current_timestamp() -> Result<Timestamp, &'static str> {
 
 fn scheduler_tick_with_clock<Clock>(
     scheduler: Scheduler,
-    assignment_timeout: Duration,
+    agents: AgentsService,
+    config: &ServerConfig,
     mut clock: Clock,
 ) -> impl FnMut() -> Result<(), SchedulerError> + Send + 'static
 where
     Clock: FnMut() -> Result<Timestamp, &'static str> + Send + 'static,
 {
+    let liveness_timeout = config.liveness_timeout;
+    let assignment_timeout = config.assignment_timeout;
     move || {
         let now = match clock() {
             Ok(now) => now,
@@ -496,6 +500,10 @@ where
                 return Ok(());
             }
         };
+        if let Err(error) = agents.sweep_liveness(now, liveness_timeout) {
+            tracing::error!(event = "agent_liveness_sweep_failed", error = %error);
+            return Ok(());
+        }
         scheduler.tick(now, assignment_timeout).map(|_| ())
     }
 }
@@ -1247,14 +1255,124 @@ mod tests {
         let state = super::server_state(store.clone(), config.assignment_timeout);
         let mut tick = super::scheduler_tick_with_clock(
             Scheduler::new(store.clone()),
-            state.assignment_timeout,
+            state.agents.clone(),
+            &config,
             || Ok(Timestamp::from_unix_millis(2_000)),
         );
 
         tick().expect("scheduler tick should succeed");
 
         assert_eq!(store.get_job(job_id).unwrap().status(), JobStatus::Lost);
+        let allocation = store.get_allocation_for_job(job_id).unwrap().unwrap();
+        let agent = store.get_agent(allocation.agent_id()).unwrap();
+        assert_eq!(agent.health(), crate::domain::AgentHealth::Healthy);
     }
+
+    #[test]
+    fn expired_agent_cannot_receive_a_pending_job_in_the_same_tick() {
+        use crate::domain::AgentHealth;
+
+        let config = config();
+        let store = StateStore::default();
+        let agent_id = AgentId::new();
+        let job_id = JobId::new();
+        let registered = Timestamp::from_unix_millis(1_000);
+        let deadline = Timestamp::from_unix_millis(31_000);
+        store
+            .register_agent(Agent::new(agent_id, "worker".into(), registered))
+            .unwrap();
+        store
+            .create_job(Job::new(
+                job_id,
+                JobSpec::new("echo", Vec::new(), None, None).unwrap(),
+                deadline,
+            ))
+            .unwrap();
+        let mut tick = super::scheduler_tick_with_clock(
+            Scheduler::new(store.clone()),
+            crate::application::AgentsService::new(store.clone()),
+            &config,
+            move || Ok(deadline),
+        );
+
+        tick().unwrap();
+
+        assert_eq!(
+            store.get_agent(agent_id).unwrap().health(),
+            AgentHealth::Unhealthy
+        );
+        assert_eq!(store.get_job(job_id).unwrap().status(), JobStatus::Pending);
+        assert!(store.get_allocation_for_job(job_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn refreshed_heartbeat_expires_without_blocking_other_work() {
+        use crate::domain::AgentHealth;
+
+        let config = config();
+        let (store, running_id) = assigned_store();
+        let allocation = store.get_allocation_for_job(running_id).unwrap().unwrap();
+        let agent_id = allocation.agent_id();
+        let future_start = Timestamp::from_unix_millis(40_000);
+        store
+            .acknowledge_start(
+                running_id,
+                agent_id,
+                allocation.id(),
+                Timestamp::from_unix_millis(1_100),
+                future_start,
+                config.assignment_timeout,
+            )
+            .unwrap();
+        store
+            .update_heartbeat(agent_id, Timestamp::from_unix_millis(2_000))
+            .unwrap();
+
+        let registered_deadline = Timestamp::from_unix_millis(31_000);
+        let refreshed_deadline = Timestamp::from_unix_millis(32_000);
+        let mut times = [registered_deadline, refreshed_deadline].into_iter();
+        let mut tick = super::scheduler_tick_with_clock(
+            Scheduler::new(store.clone()),
+            crate::application::AgentsService::new(store.clone()),
+            &config,
+            move || Ok(times.next().unwrap()),
+        );
+        tick().unwrap();
+        assert_eq!(
+            store.get_agent(agent_id).unwrap().health(),
+            AgentHealth::Healthy
+        );
+        assert_eq!(
+            store.get_job(running_id).unwrap().status(),
+            JobStatus::Running
+        );
+
+        let fresh_agent = AgentId::new();
+        store
+            .register_agent(Agent::new(fresh_agent, "fresh".into(), registered_deadline))
+            .unwrap();
+        let pending = JobId::new();
+        store
+            .create_job(Job::new(
+                pending,
+                JobSpec::new("echo", Vec::new(), None, None).unwrap(),
+                registered_deadline,
+            ))
+            .unwrap();
+        tick().unwrap();
+
+        let lost = store.get_job(running_id).unwrap();
+        assert_eq!(lost.status(), JobStatus::Lost);
+        assert_eq!(lost.finished_at(), Some(future_start));
+        assert_eq!(
+            store.get_agent(agent_id).unwrap().health(),
+            AgentHealth::Unhealthy
+        );
+        let assignment = store.get_allocation_for_job(pending).unwrap().unwrap();
+        assert_eq!(assignment.agent_id(), fresh_agent);
+        assert_eq!(assignment.assigned_at(), refreshed_deadline);
+    }
+
     #[tokio::test]
     async fn lifecycle_reporting_runs_real_assignment_through_server_and_agent() {
         use crate::{

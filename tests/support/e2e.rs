@@ -33,13 +33,19 @@ pub(super) struct Harness {
 
 impl Harness {
     pub(super) async fn start(timeout: Duration) -> io::Result<Self> {
+        Self::start_with_args(timeout, &[]).await
+    }
+
+    pub(super) async fn start_with_args(timeout: Duration, args: &[&str]) -> io::Result<Self> {
         let deadline = Instant::now() + timeout;
         let root = TempDir::new()?;
         let working_dir = root.0.join("work");
         fs::create_dir(&working_dir)?;
         let mut server = Process::spawn(
             &root.0.join("server.log"),
-            maestro().args(["server", "--bind-addr", "127.0.0.1:0"]),
+            maestro()
+                .args(["server", "--bind-addr", "127.0.0.1:0"])
+                .args(args),
             Some(SERVER_SHUTDOWN),
         )?;
         let address = server
@@ -92,6 +98,10 @@ impl Harness {
     }
 
     pub(super) async fn start_agent(&mut self) -> io::Result<Uuid> {
+        self.start_agent_with_args(&[]).await
+    }
+
+    pub(super) async fn start_agent_with_args(&mut self, args: &[&str]) -> io::Result<Uuid> {
         if self.agent.is_some() {
             return Err(io::Error::other("e2e agent already started"));
         }
@@ -102,7 +112,8 @@ impl Harness {
             maestro()
                 .args(["agent", "--server-addr", &self.address.to_string()])
                 .arg("--working-dir")
-                .arg(self.working_dir()),
+                .arg(self.working_dir())
+                .args(args),
             Some(AGENT_SHUTDOWN),
         )?;
         let id = agent
@@ -112,6 +123,39 @@ impl Harness {
             .map_err(|error| agent.failure(format_args!("invalid agent ID: {error}")))?;
         self.agent = Some(agent);
         Ok(id)
+    }
+
+    pub(super) async fn status(&mut self, id: &str) -> io::Result<Value> {
+        self.cli_json(&["status", "--json", id]).await
+    }
+
+    pub(super) async fn wait_for_status(&mut self, id: &str, expected: &str) -> io::Result<Value> {
+        let mut last_status = "unknown".to_owned();
+        loop {
+            let job = self.status(id).await.map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("waiting for job {id} to reach {expected}, last status {last_status}: {error}"),
+                )
+            })?;
+            let status = job["status"]
+                .as_str()
+                .ok_or_else(|| io::Error::other(format!("job {id} omitted its status")))?;
+            if status == expected {
+                return Ok(job);
+            }
+            if matches!(status, "succeeded" | "failed" | "stopped" | "lost") {
+                return Err(io::Error::other(format!(
+                    "job {id} reached {status} while waiting for {expected}: {job}"
+                )));
+            }
+            last_status = status.to_owned();
+            sleep_until(
+                self.deadline
+                    .min(Instant::now() + Duration::from_millis(100)),
+            )
+            .await;
+        }
     }
 
     pub(super) async fn cli_json(&mut self, args: &[&str]) -> io::Result<Value> {

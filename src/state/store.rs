@@ -958,16 +958,11 @@ impl StateStore {
                 let job_id = allocation.job_id();
                 let allocation_status = allocation.status();
                 let assigned_at = allocation.assigned_at();
-                let job_status =
-                    state
-                        .jobs
-                        .get(&job_id)
-                        .map(Job::status)
-                        .ok_or(StateStoreError::invariant(
-                            "reserved allocation references a missing job",
-                        ))?;
+                let job = state.jobs.get(&job_id).ok_or(StateStoreError::invariant(
+                    "reserved allocation references a missing job",
+                ))?;
                 let mut events = Vec::with_capacity(2);
-                if job_status == JobStatus::Pending
+                if job.status() == JobStatus::Pending
                     && allocation_status == AllocationStatus::Assigned
                 {
                     events.push(JobEvent::Assigned {
@@ -977,12 +972,14 @@ impl StateStore {
                         occurred_at: assigned_at,
                     });
                 }
+                // Expiry uses observed server time. Keep the event timestamp
+                // monotonic if a prior agent event was recorded ahead of it.
                 events.push(JobEvent::Lost {
                     job_id,
                     allocation_id,
                     agent_id,
-                    occurred_at: now,
-                    reason: crate::domain::LostReason::HeartbeatExpired,
+                    occurred_at: now.max(job.updated_at()).max(assigned_at),
+                    reason: LostReason::HeartbeatExpired,
                 });
                 let outcome = apply_events_in_state(&mut state, &events)?;
                 if outcome != ApplyOutcome::Applied {
@@ -1865,34 +1862,27 @@ mod tests {
     }
 
     #[test]
-    fn rejected_stale_lost_event_preserves_agent_job_allocation_and_reservation() {
+    fn heartbeat_expiry_preserves_a_future_lifecycle_timestamp() {
         let (store, job_id, allocation_id, agent_id) = store_with_allocation();
         assign(&store, job_id, allocation_id, agent_id, 110);
         start(&store, job_id, allocation_id, agent_id, 200);
-        let job_before = store.get_job(job_id).unwrap();
-        let allocation_before = store.get_allocation(allocation_id).unwrap();
-        let agent_before = store.get_agent(agent_id).unwrap();
 
-        assert!(matches!(
-            store.sweep_liveness(Timestamp::from_unix_millis(150), Duration::from_millis(50)),
-            Err(StateStoreError::Transition(_))
-        ));
-
-        assert_eq!(store.get_job(job_id).unwrap(), job_before);
-        assert_eq!(
-            store.get_allocation(allocation_id).unwrap(),
-            allocation_before
-        );
-        assert_eq!(store.get_agent(agent_id).unwrap(), agent_before);
         assert_eq!(
             store
-                .inner
-                .lock()
-                .expect("store lock is not poisoned")
-                .agent_allocations
-                .get(&agent_id),
-            Some(&allocation_id)
+                .sweep_liveness(Timestamp::from_unix_millis(150), Duration::from_millis(50))
+                .unwrap(),
+            vec![agent_id]
         );
+
+        let job = store.get_job(job_id).unwrap();
+        assert_eq!(job.status(), JobStatus::Lost);
+        assert_eq!(job.finished_at(), Some(Timestamp::from_unix_millis(200)));
+        let allocation = store.get_allocation(allocation_id).unwrap();
+        assert_eq!(allocation.status(), AllocationStatus::Lost);
+        assert_eq!(allocation.finished_at(), job.finished_at());
+        let agent = store.get_agent(agent_id).unwrap();
+        assert_eq!(agent.health(), AgentHealth::Unhealthy);
+        assert_eq!(agent.availability(), AgentAvailability::Idle);
     }
 
     #[test]
