@@ -118,6 +118,7 @@ pub(crate) fn run(config: AgentConfig) -> Result<(), AgentRuntimeError> {
 
     runtime.block_on(async {
         let signals = ShutdownSignals::install().map_err(AgentRuntimeError::Shutdown)?;
+        tracing::info!(event = "agent_started", server_addr = %config.server_addr);
         run_with_signal(config, signals.wait()).await
     })
 }
@@ -148,7 +149,12 @@ where
     tokio::pin!(shutdown);
     let response = tokio::select! {
         biased;
-        result = &mut shutdown => return result.map_err(AgentRuntimeError::Shutdown),
+        result = &mut shutdown => {
+            if result.is_ok() {
+                tracing::info!(event = "agent_shutdown", server_addr = %config.server_addr);
+            }
+            return result.map_err(AgentRuntimeError::Shutdown);
+        }
         response = client.register(&config.agent_address) => response.map_err(AgentRuntimeError::Client)?,
     };
     let agent = RegisteredAgent {
@@ -226,6 +232,12 @@ impl RegisteredAgent {
                 );
                 continue;
             }
+            tracing::info!(
+                event = "agent_assignment_received",
+                agent_id = %self.id,
+                job_id = %assignment.job.id,
+                allocation_id = %assignment.allocation.id
+            );
             // The consumer must resolve only after terminal handling completes.
             // Awaiting it owns the single local slot; heartbeat runs separately.
             handle_assignment
@@ -266,6 +278,7 @@ fn initialize_logging() -> Result<(), AgentRuntimeError> {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_writer(std::io::stderr)
         .try_init()
         .map_err(AgentRuntimeError::Logging)
 }

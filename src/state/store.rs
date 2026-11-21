@@ -645,6 +645,8 @@ impl StateStore {
         }
         if assignment_expired(now, allocation.assigned_at(), timeout) {
             expire_assignment(&mut state, &allocation, now)?;
+            drop(state);
+            log_assignment_expired(&allocation, now);
             return Ok(None);
         }
         Ok(Some((job, allocation)))
@@ -727,6 +729,8 @@ impl StateStore {
         }
         if assignment_expired(now, allocation.assigned_at(), timeout) {
             expire_assignment(&mut state, &allocation, now)?;
+            drop(state);
+            log_assignment_expired(&allocation, now);
             return Ok(AssignmentStartOutcome::Expired);
         }
         let outcome = apply_events_in_state(
@@ -764,10 +768,17 @@ impl StateStore {
         expired_allocations.sort_by_key(Allocation::id);
 
         let mut expired_ids = Vec::with_capacity(expired_allocations.len());
-        for allocation in expired_allocations {
-            expire_assignment(&mut state, &allocation, now)?;
+        let result = expired_allocations.iter().try_for_each(|allocation| {
+            expire_assignment(&mut state, allocation, now)?;
             expired_ids.push(allocation.id());
+            Ok::<(), StateStoreError>(())
+        });
+        drop(state);
+        // Each transition commits independently, including before a later error.
+        for allocation in expired_allocations.iter().take(expired_ids.len()) {
+            log_assignment_expired(allocation, now);
         }
+        result?;
         Ok(expired_ids)
     }
 
@@ -899,6 +910,8 @@ impl StateStore {
             && assignment_expired(now, allocation.assigned_at(), timeout)
         {
             expire_assignment(&mut state, &allocation, now)?;
+            drop(state);
+            log_assignment_expired(&allocation, now);
             return Err(StateStoreError::conflict(
                 "allocation",
                 allocation_id,
@@ -942,7 +955,8 @@ impl StateStore {
                 continue;
             }
 
-            if let Some(allocation_id) = state.agent_allocations.get(&agent_id).copied() {
+            let active_allocation = state.agent_allocations.get(&agent_id).copied();
+            let lost_job = if let Some(allocation_id) = active_allocation {
                 let allocation =
                     state
                         .allocations
@@ -974,11 +988,12 @@ impl StateStore {
                 }
                 // Expiry uses observed server time. Keep the event timestamp
                 // monotonic if a prior agent event was recorded ahead of it.
+                let lost_at = now.max(job.updated_at()).max(assigned_at);
                 events.push(JobEvent::Lost {
                     job_id,
                     allocation_id,
                     agent_id,
-                    occurred_at: now.max(job.updated_at()).max(assigned_at),
+                    occurred_at: lost_at,
                     reason: LostReason::HeartbeatExpired,
                 });
                 let outcome = apply_events_in_state(&mut state, &events)?;
@@ -987,6 +1002,7 @@ impl StateStore {
                         "liveness events did not apply to an active allocation",
                     ));
                 }
+                Some((job_id, allocation_id, lost_at))
             } else {
                 if agent.availability() != AgentAvailability::Idle {
                     return Err(StateStoreError::invariant(
@@ -1001,7 +1017,8 @@ impl StateStore {
                         "active allocation exists without an agent reservation",
                     ));
                 }
-            }
+                None
+            };
 
             let agent = state
                 .agents
@@ -1010,6 +1027,16 @@ impl StateStore {
                     "liveness candidate is no longer registered",
                 ))?;
             agent.mark_unhealthy();
+            drop(state);
+            if let Some((job_id, allocation_id, lost_at)) = lost_job {
+                log_lost(
+                    job_id,
+                    allocation_id,
+                    agent_id,
+                    lost_at,
+                    "heartbeat_expired",
+                );
+            }
             unhealthy_agents.push(agent_id);
         }
 
@@ -1190,6 +1217,30 @@ fn expire_assignment(
         ));
     }
     Ok(())
+}
+
+fn log_assignment_expired(allocation: &Allocation, expired_at: Timestamp) {
+    log_lost(
+        allocation.job_id(),
+        allocation.id(),
+        allocation.agent_id(),
+        expired_at,
+        "assignment_expired",
+    );
+}
+
+fn log_lost(
+    job_id: JobId,
+    allocation_id: AllocationId,
+    agent_id: AgentId,
+    lost_at: Timestamp,
+    reason: &'static str,
+) {
+    tracing::warn!(
+        event = "job_terminal",
+        %job_id, %allocation_id, %agent_id,
+        occurred_at_ms = lost_at.as_unix_millis(), result = "lost", reason
+    );
 }
 
 fn remove_queued_assignment(

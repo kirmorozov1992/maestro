@@ -1,9 +1,9 @@
 use crate::{
     application::{AgentsService, JobDetails, JobsService, StopOutcome},
     config::ServerConfig,
-    domain::{AgentId, AllocationId, ApplyOutcome, JobEvent, Timestamp},
+    domain::{AgentId, AllocationId, ApplyOutcome, JobEvent, ProcessResult, StopReason, Timestamp},
     error::{AppError, ErrorKind},
-    scheduler::{Scheduler, SchedulerError},
+    scheduler::{Scheduler, SchedulerError, TickOutcome},
     scheduler_loop::{SchedulerLoop, SchedulerLoopError},
     state::store::{AssignmentStartOutcome, StateStore},
     transport::v1::{
@@ -97,6 +97,7 @@ fn initialize_logging() -> Result<(), ServerError> {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_writer(io::stderr)
         .try_init()
         .map_err(ServerError::Logging)
 }
@@ -130,11 +131,11 @@ where
     let serve_result = axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown)
         .await;
-    tracing::info!(event = "server_stopped", bind_addr = %bind_addr);
     let scheduler_result = scheduler_loop.stop();
 
     serve_result.map_err(ServerError::Serve)?;
     scheduler_result.map_err(ServerError::SchedulerLoop)?;
+    tracing::info!(event = "server_stopped", bind_addr = %bind_addr);
     Ok(())
 }
 
@@ -190,11 +191,17 @@ async fn create_job(
         .jobs
         .submit_job(request.into_submission(), submitted_at)
     {
-        Ok(job) => (
-            StatusCode::CREATED,
-            Json(JobResponse::from_parts(&job, None)),
-        )
-            .into_response(),
+        Ok(job) => {
+            tracing::info!(
+                event = "job_submitted", job_id = %job.id,
+                occurred_at_ms = submitted_at.as_unix_millis()
+            );
+            (
+                StatusCode::CREATED,
+                Json(JobResponse::from_parts(&job, None)),
+            )
+                .into_response()
+        }
         Err(error) => app_error_response(error),
     }
 }
@@ -390,7 +397,13 @@ async fn report_allocation_event(
                 occurred_at,
                 state.assignment_timeout,
             ) {
-                Ok(AssignmentStartOutcome::Started) => event_report_response(ApplyOutcome::Applied),
+                Ok(AssignmentStartOutcome::Started) => {
+                    tracing::info!(
+                        event = "job_started", %job_id, %allocation_id, %agent_id,
+                        occurred_at_ms = occurred_at.as_unix_millis()
+                    );
+                    event_report_response(ApplyOutcome::Applied)
+                }
                 Ok(AssignmentStartOutcome::Duplicate) => {
                     event_report_response(ApplyOutcome::Duplicate)
                 }
@@ -407,13 +420,72 @@ async fn report_allocation_event(
             };
             match state
                 .agents
-                .report_allocation_event(event, now, state.assignment_timeout)
+                .report_allocation_event(&event, now, state.assignment_timeout)
             {
-                Ok(outcome) => event_report_response(outcome),
+                Ok(outcome) => {
+                    if outcome == ApplyOutcome::Applied {
+                        log_terminal_event(&event);
+                    }
+                    event_report_response(outcome)
+                }
                 Err(error) => app_error_response(error),
             }
         }
     }
+}
+
+fn log_terminal_event(event: &JobEvent) {
+    let (job_id, allocation_id, agent_id, occurred_at, result, exit_code, reason) = match *event {
+        JobEvent::Finished {
+            job_id,
+            allocation_id,
+            agent_id,
+            occurred_at,
+            result,
+        } => {
+            let (result, exit_code) = match result {
+                ProcessResult::Exited { exit_code } => ("exited", Some(exit_code)),
+                ProcessResult::SpawnFailed => ("spawn_failed", None),
+                ProcessResult::ExecutionFailed => ("execution_failed", None),
+            };
+            (
+                job_id,
+                allocation_id,
+                agent_id,
+                occurred_at,
+                result,
+                exit_code,
+                None,
+            )
+        }
+        JobEvent::Stopped {
+            job_id,
+            allocation_id: Some(allocation_id),
+            agent_id: Some(agent_id),
+            occurred_at,
+            reason,
+        } => {
+            let reason = match reason {
+                StopReason::UserRequested => "user_requested",
+                StopReason::AgentShutdown => "agent_shutdown",
+            };
+            (
+                job_id,
+                allocation_id,
+                agent_id,
+                occurred_at,
+                "stopped",
+                None,
+                Some(reason),
+            )
+        }
+        _ => return,
+    };
+    tracing::info!(
+        event = "job_terminal",
+        %job_id, %allocation_id, %agent_id,
+        occurred_at_ms = occurred_at.as_unix_millis(), result, exit_code, reason
+    );
 }
 
 fn event_report_response(outcome: ApplyOutcome) -> Response {
@@ -504,7 +576,16 @@ where
             tracing::error!(event = "agent_liveness_sweep_failed", error = %error);
             return Ok(());
         }
-        scheduler.tick(now, assignment_timeout).map(|_| ())
+        if let TickOutcome::Assigned(assignment) = scheduler.tick(now, assignment_timeout)? {
+            tracing::info!(
+                event = "job_assigned",
+                job_id = %assignment.job_id(),
+                allocation_id = %assignment.allocation_id(),
+                agent_id = %assignment.agent_id(),
+                occurred_at_ms = now.as_unix_millis()
+            );
+        }
+        Ok(())
     }
 }
 

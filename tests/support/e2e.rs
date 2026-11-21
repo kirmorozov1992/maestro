@@ -107,8 +107,14 @@ impl Harness {
         }
         self.server.check_deadline(self.deadline, "agent start")?;
         self.server.check_running()?;
+        let (agent, id) = self.launch_agent("agent.log", args).await?;
+        self.agent = Some(agent);
+        Ok(id)
+    }
+
+    async fn launch_agent(&self, log_name: &str, args: &[&str]) -> io::Result<(Process, Uuid)> {
         let mut agent = Process::spawn(
-            &self.root.0.join("agent.log"),
+            &self.root.0.join(log_name),
             maestro()
                 .args(["agent", "--server-addr", &self.address.to_string()])
                 .arg("--working-dir")
@@ -121,8 +127,13 @@ impl Harness {
             .await?
             .parse::<Uuid>()
             .map_err(|error| agent.failure(format_args!("invalid agent ID: {error}")))?;
-        self.agent = Some(agent);
-        Ok(id)
+        Ok((agent, id))
+    }
+
+    pub(super) async fn terminal_log_field(&mut self, field: &str) -> io::Result<String> {
+        self.server
+            .wait_for_field(self.deadline, "job_terminal", field)
+            .await
     }
 
     pub(super) async fn status(&mut self, id: &str) -> io::Result<Value> {
@@ -188,7 +199,7 @@ fn maestro() -> Command {
     command
         .env_clear()
         .env("NO_COLOR", "1")
-        .env("RUST_LOG", "info")
+        .env("RUST_LOG", "maestro=debug")
         .env("TOKIO_WORKER_THREADS", "2")
         .stdin(Stdio::null());
     command
@@ -244,13 +255,17 @@ impl Process {
         fs::read_to_string(&self.log_path)
     }
 
+    fn stderr(&self) -> io::Result<String> {
+        fs::read_to_string(&self.stderr_path)
+    }
+
     fn failure(&self, reason: impl std::fmt::Display) -> io::Error {
         io::Error::other(format!(
             "{reason} ({:?})\nstdout:\n{}\nstderr:\n{}",
             self.log_path,
             self.log()
                 .unwrap_or_else(|error| format!("could not read stdout: {error}")),
-            fs::read_to_string(&self.stderr_path)
+            self.stderr()
                 .unwrap_or_else(|error| format!("could not read stderr: {error}")),
         ))
     }
@@ -274,7 +289,7 @@ impl Process {
             self.check_deadline(deadline, &event)?;
             self.check_running()?;
             if let Some(value) = self
-                .log()?
+                .stderr()?
                 .split_inclusive('\n')
                 .filter(|line| line.ends_with('\n'))
                 .find(|line| line.split_whitespace().any(|part| part == event))
@@ -380,6 +395,180 @@ impl Drop for Process {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn concurrent_jobs_log_committed_transitions_without_user_data() {
+        let mut harness = Harness::start(Duration::from_secs(25)).await.unwrap();
+        let first_agent_id = harness.start_agent().await.unwrap();
+        let (mut second_agent, second_agent_id) =
+            harness.launch_agent("second-agent.log", &[]).await.unwrap();
+
+        let mut running = Vec::new();
+        for name in ["first-log", "second-log"] {
+            let id = crate::submit_fixture(&mut harness, name, "log").await;
+            running.push((name, harness.wait_for_status(&id, "running").await.unwrap()));
+        }
+        assert_ne!(
+            running[0].1["allocation"]["agent_id"],
+            running[1].1["allocation"]["agent_id"]
+        );
+        assert_eq!(
+            harness
+                .status(running[0].1["id"].as_str().unwrap())
+                .await
+                .unwrap()["status"],
+            "running"
+        );
+        while !running.iter().all(|(name, _)| {
+            harness
+                .working_dir()
+                .join(format!("{name}.started"))
+                .is_file()
+        }) {
+            harness
+                .server
+                .check_deadline(harness.deadline, "both job fixtures")
+                .unwrap();
+            pause_until(harness.deadline).await;
+        }
+        for (name, _) in &running {
+            fs::write(harness.working_dir().join(format!("{name}.release")), b"").unwrap();
+        }
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        for (_, job) in &mut running {
+            let id = job["id"].as_str().unwrap();
+            let terminal = harness.wait_for_status(id, "succeeded").await.unwrap();
+            let allocation = &terminal["allocation"];
+            let allocation_id = allocation["id"].as_str().unwrap();
+            let replay = client
+                .post(format!(
+                    "http://{}/v1/allocations/{allocation_id}/events",
+                    harness.address()
+                ))
+                .json(&serde_json::json!({
+                    "type": "finished",
+                    "job_id": id,
+                    "agent_id": allocation["agent_id"],
+                    "occurred_at": terminal["finished_at"],
+                    "result": terminal["terminal_result"],
+                }))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap();
+            assert_eq!(replay["outcome"], "duplicate");
+            *job = terminal;
+        }
+
+        second_agent.stop();
+        let first_agent = harness.agent.as_mut().unwrap();
+        first_agent.stop();
+        harness.server.stop();
+
+        let server_logs = harness.server.stderr().unwrap();
+        let worker_logs = [first_agent, &mut second_agent].map(|agent| {
+            assert_eq!(agent.log().unwrap(), "");
+            agent.stderr().unwrap()
+        });
+        assert_eq!(
+            harness.server.log().unwrap(),
+            "",
+            "server diagnostics must go to stderr"
+        );
+        assert_event(&server_logs, "server_started", &["bind_addr"]);
+        assert_event(&server_logs, "server_stopped", &["bind_addr"]);
+        for (log, id) in worker_logs.iter().zip([first_agent_id, second_agent_id]) {
+            assert_event(log, "agent_started", &["server_addr"]);
+            let agent = format!("agent_id={id}");
+            assert_event(log, "agent_registered", &[&agent]);
+            assert_event(log, "agent_shutdown", &[&agent]);
+        }
+
+        for (_, job) in running {
+            let allocation = &job["allocation"];
+            let job_id = format!("job_id={}", job["id"].as_str().unwrap());
+            let allocation_id = format!("allocation_id={}", allocation["id"].as_str().unwrap());
+            let agent_id = format!("agent_id={}", allocation["agent_id"].as_str().unwrap());
+            let fields = [job_id.as_str(), &allocation_id, &agent_id];
+            let submitted_at = format!("occurred_at_ms={}", job["submitted_at"]);
+            let assigned_at = format!("occurred_at_ms={}", allocation["assigned_at"]);
+            let started_at = format!("occurred_at_ms={}", job["started_at"]);
+            let finished_at = format!("occurred_at_ms={}", job["finished_at"]);
+            assert_event(&server_logs, "job_submitted", &[&job_id, &submitted_at]);
+            assert_event(
+                &server_logs,
+                "job_assigned",
+                &[&job_id, &allocation_id, &agent_id, &assigned_at],
+            );
+            assert_event(
+                &server_logs,
+                "job_started",
+                &[&job_id, &allocation_id, &agent_id, &started_at],
+            );
+            assert_event(
+                &server_logs,
+                "job_terminal",
+                &[
+                    &job_id,
+                    &allocation_id,
+                    &agent_id,
+                    &finished_at,
+                    "result=\"exited\"",
+                    "exit_code=0",
+                ],
+            );
+            let worker_log =
+                &worker_logs[usize::from(allocation["agent_id"] == second_agent_id.to_string())];
+            assert_event(worker_log, "agent_assignment_received", &fields);
+            assert_event(
+                worker_log,
+                "agent_process_output_summary",
+                &[&job_id, &allocation_id, &agent_id, "stdout_truncated=true"],
+            );
+        }
+
+        for log in std::iter::once(&server_logs).chain(&worker_logs) {
+            for forbidden in [
+                "m81-secret-env-value",
+                "MAESTRO_E2E_SECRET_TOKEN",
+                "m81-private-stdout",
+                "m81-private-stderr",
+                "--nocapture",
+                "job_process_fixture",
+                "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ] {
+                assert!(!log.contains(forbidden), "log contains {forbidden}");
+            }
+        }
+    }
+
+    fn assert_event(log: &str, event: &str, fields: &[&str]) {
+        let name = format!("event=\"{event}\"");
+        let count = log
+            .lines()
+            .filter(|line| {
+                line.split_whitespace().any(|word| word == name)
+                    && fields.iter().all(|field| {
+                        line.split_whitespace().any(|word| {
+                            word == *field
+                                || (!field.contains('=')
+                                    && word
+                                        .strip_prefix(field)
+                                        .is_some_and(|rest| rest.starts_with('=')))
+                        })
+                    })
+            })
+            .count();
+        assert_eq!(count, 1, "{event}: {fields:?} in {log}");
+    }
 
     #[tokio::test]
     async fn startup_wait_reports_an_exited_process() {

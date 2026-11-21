@@ -114,7 +114,8 @@ impl JobsService {
         let job = self.store.get_job(id).map_err(map_store_error)?;
         match job.status() {
             JobStatus::Pending => {
-                self.store
+                let outcome = self
+                    .store
                     .append_event(&JobEvent::Stopped {
                         job_id: id,
                         allocation_id: None,
@@ -123,6 +124,10 @@ impl JobsService {
                         reason: StopReason::UserRequested,
                     })
                     .map_err(map_store_error)?;
+                if outcome == ApplyOutcome::Applied {
+                    tracing::info!(event = "job_terminal", job_id = %id, result = "stopped",
+                        reason = "user_requested", occurred_at_ms = stopped_at.as_unix_millis());
+                }
                 let stopped_job = self.store.get_job(id).map_err(map_store_error)?;
                 Ok(StopOutcome::Completed(JobSnapshot::from(&stopped_job)))
             }

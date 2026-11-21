@@ -108,7 +108,7 @@ impl AgentsService {
 
     pub(crate) fn report_allocation_event(
         &self,
-        event: JobEvent,
+        event: &JobEvent,
         now: Timestamp,
         timeout: Duration,
     ) -> Result<ApplyOutcome, AppError> {
@@ -119,7 +119,7 @@ impl AgentsService {
         }
 
         self.store
-            .append_agent_event(&event, now, timeout)
+            .append_agent_event(event, now, timeout)
             .map_err(map_store_error)
     }
 
