@@ -318,6 +318,15 @@ mod tests {
             .unwrap()
     }
 
+    fn prepare_fixture_program(path: &Path) {
+        // A concurrent fork can retain the writable descriptor of a copied
+        // executable until it execs. Refer to the existing build artifact.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(executable(), path).unwrap();
+        #[cfg(not(unix))]
+        fs::copy(executable(), path).unwrap();
+    }
+
     fn fixture_args(extra: &[&str]) -> Vec<String> {
         let mut args = vec![
             FIXTURE.to_owned(),
@@ -499,7 +508,7 @@ mod tests {
     async fn passes_literal_arguments_and_launches_executable_with_spaces() {
         let root = TestRoot::new();
         let program = root.0.join("literal program ; name");
-        fs::copy(executable(), &program).unwrap();
+        prepare_fixture_program(&program);
         let output = root.0.join("observed.json");
         let literal = [
             "",
@@ -539,7 +548,7 @@ mod tests {
         let job_dir = root.0.join("рабочий каталог");
         fs::create_dir(&job_dir).unwrap();
         let program = job_dir.join("тестовая программа");
-        fs::copy(executable(), &program).unwrap();
+        prepare_fixture_program(&program);
         let output = root.0.join("cwd.json");
         let mut environment = fixture_env("inspect", &output);
         environment.insert(OVERRIDE.into(), String::new());
@@ -574,7 +583,7 @@ mod tests {
     async fn searches_unqualified_program_name_using_child_path_override() {
         let root = TestRoot::new();
         let program = root.0.join("fixture-command");
-        fs::copy(executable(), &program).unwrap();
+        prepare_fixture_program(&program);
         let output = root.0.join("path.json");
         let mut env = fixture_env("inspect", &output);
         env.insert("PATH".into(), root.0.to_str().unwrap().into());

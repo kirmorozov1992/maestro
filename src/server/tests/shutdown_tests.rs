@@ -5,6 +5,37 @@ use crate::worker::agent::test_support::{
 };
 use tokio::signal::unix::SignalKind;
 
+struct SignalTestRoot(std::path::PathBuf);
+
+impl SignalTestRoot {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!("maestro-m69-signal-{}", JobId::new()));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for SignalTestRoot {
+    fn drop(&mut self) {
+        for attempt in 0..3 {
+            match std::fs::remove_dir_all(&self.0) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                // A fixture can publish its PID during panic cleanup.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::DirectoryNotEmpty && attempt < 2 => {}
+                Err(error) => {
+                    eprintln!(
+                        "could not remove signal test directory {:?}: {error}",
+                        self.0
+                    );
+                    return;
+                }
+            }
+        }
+    }
+}
+
 async fn server_that_schedules_before_event_ack(
     store: StateStore,
 ) -> (
@@ -52,10 +83,10 @@ async fn unix_signals_reap_active_child_report_stopped_and_never_launch_queued_j
         let store = StateStore::default();
         let (address, server_stop, server) =
             server_that_schedules_before_event_ack(store.clone()).await;
-        let root = std::env::temp_dir().join(format!("maestro-m69-signal-{}", JobId::new()));
-        std::fs::create_dir(&root).unwrap();
+        let temp_dir = SignalTestRoot::new();
+        let root = &temp_dir.0;
         std::fs::create_dir(root.join("queued")).unwrap();
-        let mut agent = spawn_signal_agent(address, &root);
+        let mut agent = spawn_signal_agent(address, root);
         let release = FixtureRelease::new(vec![root.join("release"), root.join("queued/release")]);
         tokio::time::timeout(Duration::from_secs(4), async {
             while store.list_agents().unwrap().is_empty() {
@@ -64,7 +95,7 @@ async fn unix_signals_reap_active_child_report_stopped_and_never_launch_queued_j
         })
         .await
         .unwrap();
-        let running = super::stop_tests::submit_wait(address, &root, "wait").await;
+        let running = super::stop_tests::submit_wait(address, root, "wait").await;
         let queued = super::stop_tests::submit_wait(address, &root.join("queued"), "wait").await;
         let scheduler = Scheduler::new(store.clone());
         scheduler
@@ -111,7 +142,10 @@ async fn unix_signals_reap_active_child_report_stopped_and_never_launch_queued_j
                 .len(),
             1
         );
-        std::fs::remove_dir_all(root).unwrap();
+        let removed = root.clone();
+        drop(release);
+        drop(temp_dir);
+        assert!(!removed.exists());
     }
 }
 

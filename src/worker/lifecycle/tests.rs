@@ -184,13 +184,19 @@ fn process_fixture() {
             stdout.flush().unwrap();
             drop(stdout);
         }
-        std::fs::write(
-            std::env::var("MAESTRO_M67_READY").unwrap(),
-            std::process::id().to_string(),
-        )
-        .unwrap();
-        let release = PathBuf::from(std::env::var("MAESTRO_M67_RELEASE").unwrap());
-        while !release.exists() {
+        let ready = PathBuf::from(std::env::var_os("MAESTRO_M67_READY").unwrap());
+        let staging = ready.with_extension("pid-tmp");
+        // Publish the complete PID before a reader can observe readiness.
+        std::fs::write(&staging, std::process::id().to_string()).unwrap();
+        std::fs::rename(staging, &ready).unwrap();
+        let release = PathBuf::from(std::env::var_os("MAESTRO_M67_RELEASE").unwrap());
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        // If teardown removes the directory before we see release, exit anyway.
+        while ready.is_file() && !release.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture release timed out"
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
     }
